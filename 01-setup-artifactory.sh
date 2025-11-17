@@ -13,14 +13,20 @@
 #
 #  2. Preparation (The "Claim"):
 #     - Takes ownership of the config directory so we can
-#       write files without sudo.
+#       write files and copy certificates without sudo.
 #
-#  3. Blueprint Generation:
-#     - Generates 'master.key' file (Encryption).
-#     - Generates 'bootstrap.creds' file (Admin Reset).
+#  3. Certificate Staging (The "Permission Fix"):
+#     - Copies Host SSL certs into the config structure.
+#     - Copies Root CA into the 'trusted' directory.
+#     - This ensures they get the correct 1030:1030 ownership
+#       later, avoiding Docker bind-mount permission errors.
+#
+#  4. Blueprint Generation:
+#     - Generates 'master.key' (Encryption).
+#     - Generates 'bootstrap.creds' (Admin Reset).
 #     - Generates 'system.yaml' (Infrastructure Config).
 #
-#  4. Permissions (The "Handover"):
+#  5. Permissions (The "Handover"):
 #     - Sets strict 0600 permissions for secrets.
 #     - Sets UID 1030 ownership for the container to use.
 # -----------------------------------------------------------
@@ -32,8 +38,13 @@ echo "Starting Artifactory 'Architect' Setup..."
 ARTIFACTORY_BASE="$HOME/cicd_stack/artifactory"
 VAR_ETC="$ARTIFACTORY_BASE/var/etc"
 
-# Master Secrets File
+# Secrets
 MASTER_ENV_FILE="$HOME/cicd_stack/cicd.env"
+
+# Source Certs (from Article 2)
+CA_CERT_PATH="$HOME/cicd_stack/ca/pki/certs/ca.pem"
+SERVICE_CERT_PATH="$HOME/cicd_stack/ca/pki/services/artifactory.cicd.local/artifactory.cicd.local.crt.pem"
+SERVICE_KEY_PATH="$HOME/cicd_stack/ca/pki/services/artifactory.cicd.local/artifactory.cicd.local.key.pem"
 
 # --- 2. Load & Persist Secrets ---
 if [ ! -f "$MASTER_ENV_FILE" ]; then
@@ -47,7 +58,7 @@ source "$MASTER_ENV_FILE"
 
 echo "Checking for Master Key..."
 
-# A. Check/Generate Master Key
+# A. Check/Generate Master Key (256-bit AES)
 if [ -z "$ARTIFACTORY_MASTER_KEY" ]; then
     echo "WARNING: ARTIFACTORY_MASTER_KEY not found in cicd.env."
     echo "    Generating a new persistent 256-bit Master Key..."
@@ -86,7 +97,7 @@ else
 fi
 
 # --- 3. Claim Ownership ---
-# If the directory exists (from a previous run), it might be owned by 1030.
+# If the directory exists (from a previous run), it is likely owned by 1030.
 # We take it back to the current user so we can write files easily.
 if [ -d "$ARTIFACTORY_BASE" ]; then
     echo "Claiming ownership of $ARTIFACTORY_BASE..."
@@ -95,10 +106,35 @@ fi
 
 # --- 4. Create Directory Structure ---
 echo "Creating configuration directories..."
-mkdir -p "$VAR_ETC/security"
+mkdir -p "$VAR_ETC/security/ssl"
+mkdir -p "$VAR_ETC/security/keys/trusted"
 mkdir -p "$VAR_ETC/access"
 
-# --- 5. Generate Secret Files ---
+# --- 5. Stage Certificates ---
+echo "Staging certificates..."
+
+# A. Copy Service Certs (For HTTPS UI)
+if [ -f "$SERVICE_CERT_PATH" ] && [ -f "$SERVICE_KEY_PATH" ]; then
+    cp "$SERVICE_CERT_PATH" "$VAR_ETC/security/ssl/"
+    cp "$SERVICE_KEY_PATH" "$VAR_ETC/security/ssl/"
+    echo "   - HTTPS Certificates copied."
+else
+    echo "ERROR: Artifactory certificates not found at:"
+    echo "   $SERVICE_CERT_PATH"
+    echo "   Please run Article 2 scripts first."
+    exit 1
+fi
+
+# B. Copy Root CA (For Outbound Trust)
+if [ -f "$CA_CERT_PATH" ]; then
+    cp "$CA_CERT_PATH" "$VAR_ETC/security/keys/trusted/"
+    echo "   - Root CA copied to trusted directory."
+else
+    echo "ERROR: Root CA not found at $CA_CERT_PATH"
+    exit 1
+fi
+
+# --- 6. Generate Secret Files ---
 echo "Writing secret files..."
 
 # A. master.key
@@ -114,7 +150,7 @@ echo "admin@*=$ARTIFACTORY_ADMIN_PASSWORD" > "$CREDS_FILE"
 # IMPORTANT: Security requirement (0600)
 chmod 600 "$CREDS_FILE"
 
-# --- 6. Generate 'system.yaml' Blueprint ---
+# --- 7. Generate 'system.yaml' Blueprint ---
 # This configures the infrastructure: Ports, SSL, and Security.
 SYSTEM_YAML="$VAR_ETC/system.yaml"
 echo "Generating 'system.yaml' configuration..."
@@ -136,7 +172,7 @@ artifactory:
     httpsConnector:
       enabled: true
       port: 10500
-      # Paths inside the container (where we will mount the certs)
+      # Paths inside the container (relative to where we mount var/etc)
       certificateFile: "/var/opt/jfrog/artifactory/var/etc/security/ssl/artifactory.cicd.local.crt.pem"
       certificateKeyFile: "/var/opt/jfrog/artifactory/var/etc/security/ssl/artifactory.cicd.local.key.pem"
 
@@ -155,7 +191,7 @@ event:
 EOF
 echo "   Done."
 
-# --- 7. Permission Handover (UID 1030) ---
+# --- 8. Permission Handover (UID 1030) ---
 echo "Setting directory permissions..."
 echo "   Handing ownership to Artifactory UID 1030..."
 
