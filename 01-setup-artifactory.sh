@@ -11,21 +11,24 @@
 #     - If missing, generates a secure 256-bit key and
 #       SAVES IT BACK to 'cicd.env' to ensure persistence.
 #
-#  2. Blueprint Generation:
+#  2. Preparation (The "Claim"):
+#     - Takes ownership of the config directory so we can
+#       write files without sudo.
+#
+#  3. Blueprint Generation:
 #     - Generates 'master.key' file (Encryption).
 #     - Generates 'bootstrap.creds' file (Admin Reset).
 #     - Generates 'system.yaml' (Infrastructure Config).
 #
-#  3. Permissions:
+#  4. Permissions (The "Handover"):
 #     - Sets strict 0600 permissions for secrets.
-#     - Sets UID 1030 ownership for all bind mounts.
+#     - Sets UID 1030 ownership for the container to use.
 # -----------------------------------------------------------
 
 set -e
 echo "Starting Artifactory 'Architect' Setup..."
 
 # --- 1. Define Paths ---
-# We use the standard "City" layout
 ARTIFACTORY_BASE="$HOME/cicd_stack/artifactory"
 VAR_ETC="$ARTIFACTORY_BASE/var/etc"
 
@@ -45,7 +48,6 @@ source "$MASTER_ENV_FILE"
 echo "Checking for Master Key..."
 
 # A. Check/Generate Master Key
-# We use 32 bytes (64 hex chars) for 256-bit AES security.
 if [ -z "$ARTIFACTORY_MASTER_KEY" ]; then
     echo "WARNING: ARTIFACTORY_MASTER_KEY not found in cicd.env."
     echo "    Generating a new persistent 256-bit Master Key..."
@@ -66,7 +68,6 @@ else
 fi
 
 # B. Check/Generate Admin Password
-# This is only used on the very first bootstrap of the database.
 if [ -z "$ARTIFACTORY_ADMIN_PASSWORD" ]; then
     echo "WARNING: ARTIFACTORY_ADMIN_PASSWORD not found in cicd.env."
     echo "    Generating a new initial admin password..."
@@ -84,12 +85,20 @@ else
      echo "Found existing ARTIFACTORY_ADMIN_PASSWORD in cicd.env."
 fi
 
-# --- 3. Create Directory Structure ---
+# --- 3. Claim Ownership ---
+# If the directory exists (from a previous run), it might be owned by 1030.
+# We take it back to the current user so we can write files easily.
+if [ -d "$ARTIFACTORY_BASE" ]; then
+    echo "Claiming ownership of $ARTIFACTORY_BASE..."
+    sudo chown -R $(id -u):$(id -g) "$ARTIFACTORY_BASE"
+fi
+
+# --- 4. Create Directory Structure ---
 echo "Creating configuration directories..."
 mkdir -p "$VAR_ETC/security"
 mkdir -p "$VAR_ETC/access"
 
-# --- 4. Generate Secret Files ---
+# --- 5. Generate Secret Files ---
 echo "Writing secret files..."
 
 # A. master.key
@@ -105,7 +114,7 @@ echo "admin@*=$ARTIFACTORY_ADMIN_PASSWORD" > "$CREDS_FILE"
 # IMPORTANT: Security requirement (0600)
 chmod 600 "$CREDS_FILE"
 
-# --- 5. Generate 'system.yaml' Blueprint ---
+# --- 6. Generate 'system.yaml' Blueprint ---
 # This configures the infrastructure: Ports, SSL, and Security.
 SYSTEM_YAML="$VAR_ETC/system.yaml"
 echo "Generating 'system.yaml' configuration..."
@@ -146,11 +155,10 @@ event:
 EOF
 echo "   Done."
 
-# --- 6. Permission Fix (UID 1030) ---
+# --- 7. Permission Handover (UID 1030) ---
 echo "Setting directory permissions..."
-echo "   Artifactory runs as UID 1030. We must set ownership for bind mounts."
+echo "   Handing ownership to Artifactory UID 1030..."
 
-# We ensure the entire base directory is owned by 1030
 if [ -d "$ARTIFACTORY_BASE" ]; then
     sudo chown -R 1030:1030 "$ARTIFACTORY_BASE"
     echo "Permissions set on $ARTIFACTORY_BASE"
