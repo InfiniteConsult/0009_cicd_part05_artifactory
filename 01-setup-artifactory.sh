@@ -12,21 +12,15 @@
 #       SAVES IT BACK to 'cicd.env' to ensure persistence.
 #
 #  2. Preparation (The "Claim"):
-#     - Takes ownership of the config directory so we can
-#       write files and copy certificates without sudo.
+#     - Takes ownership AND write permissions of the config
+#       directory so we can overwrite files safely.
 #
-#  3. Certificate Staging (The "Permission Fix"):
-#     - Copies Host SSL certs into the config structure.
-#     - Copies Root CA into the 'trusted' directory.
-#     - This ensures they get the correct 1030:1030 ownership
-#       later, avoiding Docker bind-mount permission errors.
-#
-#  4. Blueprint Generation:
-#     - Generates 'master.key' (Encryption).
-#     - Generates 'bootstrap.creds' (Admin Reset).
+#  3. Blueprint Generation:
+#     - Generates 'master.key' file (Encryption).
+#     - Generates 'bootstrap.creds' file (Admin Reset).
 #     - Generates 'system.yaml' (Infrastructure Config).
 #
-#  5. Permissions (The "Handover"):
+#  4. Permissions (The "Handover"):
 #     - Sets strict 0600 permissions for secrets.
 #     - Sets UID 1030 ownership for the container to use.
 # -----------------------------------------------------------
@@ -38,7 +32,7 @@ echo "Starting Artifactory 'Architect' Setup..."
 ARTIFACTORY_BASE="$HOME/cicd_stack/artifactory"
 VAR_ETC="$ARTIFACTORY_BASE/var/etc"
 
-# Secrets
+# Master Secrets File
 MASTER_ENV_FILE="$HOME/cicd_stack/cicd.env"
 
 # Source Certs (from Article 2)
@@ -58,7 +52,7 @@ source "$MASTER_ENV_FILE"
 
 echo "Checking for Master Key..."
 
-# A. Check/Generate Master Key (256-bit AES)
+# A. Check/Generate Master Key
 if [ -z "$ARTIFACTORY_MASTER_KEY" ]; then
     echo "WARNING: ARTIFACTORY_MASTER_KEY not found in cicd.env."
     echo "    Generating a new persistent 256-bit Master Key..."
@@ -96,12 +90,12 @@ else
      echo "Found existing ARTIFACTORY_ADMIN_PASSWORD in cicd.env."
 fi
 
-# --- 3. Claim Ownership ---
-# If the directory exists (from a previous run), it is likely owned by 1030.
-# We take it back to the current user so we can write files easily.
+# --- 3. Claim Ownership & Write Permissions ---
+# If the directory exists, we ensure we own it AND can write to it.
 if [ -d "$ARTIFACTORY_BASE" ]; then
-    echo "Claiming ownership of $ARTIFACTORY_BASE..."
+    echo "Claiming ownership and write access for $ARTIFACTORY_BASE..."
     sudo chown -R $(id -u):$(id -g) "$ARTIFACTORY_BASE"
+    sudo chmod -R u+w "$ARTIFACTORY_BASE"
 fi
 
 # --- 4. Create Directory Structure ---
@@ -115,8 +109,8 @@ echo "Staging certificates..."
 
 # A. Copy Service Certs (For HTTPS UI)
 if [ -f "$SERVICE_CERT_PATH" ] && [ -f "$SERVICE_KEY_PATH" ]; then
-    cp "$SERVICE_CERT_PATH" "$VAR_ETC/security/ssl/"
-    cp "$SERVICE_KEY_PATH" "$VAR_ETC/security/ssl/"
+    cp -f "$SERVICE_CERT_PATH" "$VAR_ETC/security/ssl/"
+    cp -f "$SERVICE_KEY_PATH" "$VAR_ETC/security/ssl/"
     echo "   - HTTPS Certificates copied."
 else
     echo "ERROR: Artifactory certificates not found at:"
@@ -127,7 +121,7 @@ fi
 
 # B. Copy Root CA (For Outbound Trust)
 if [ -f "$CA_CERT_PATH" ]; then
-    cp "$CA_CERT_PATH" "$VAR_ETC/security/keys/trusted/"
+    cp -f "$CA_CERT_PATH" "$VAR_ETC/security/keys/trusted/"
     echo "   - Root CA copied to trusted directory."
 else
     echo "ERROR: Root CA not found at $CA_CERT_PATH"
@@ -155,6 +149,8 @@ chmod 600 "$CREDS_FILE"
 SYSTEM_YAML="$VAR_ETC/system.yaml"
 echo "Generating 'system.yaml' configuration..."
 
+# FIXED: Removed invalid 'connector: enabled: false'
+# FIXED: Corrected cert paths to remove extra '/var' to match mount point
 cat << EOF > "$SYSTEM_YAML"
 shared:
   node:
@@ -163,18 +159,13 @@ shared:
 
 artifactory:
   tomcat:
-    # Disable standard HTTP connector (default 8081)
-    connector:
-      enabled: false
-
     # Enable HTTPS connector on port 10500
-    # This aligns with our host port mapping to prevent Split-Horizon issues.
     httpsConnector:
       enabled: true
       port: 10500
-      # Paths inside the container (relative to where we mount var/etc)
-      certificateFile: "/var/opt/jfrog/artifactory/var/etc/security/ssl/artifactory.cicd.local.crt.pem"
-      certificateKeyFile: "/var/opt/jfrog/artifactory/var/etc/security/ssl/artifactory.cicd.local.key.pem"
+      # Paths inside the container (mounted to /var/opt/jfrog/artifactory/etc/...)
+      certificateFile: "/var/opt/jfrog/artifactory/etc/security/ssl/artifactory.cicd.local.crt.pem"
+      certificateKeyFile: "/var/opt/jfrog/artifactory/etc/security/ssl/artifactory.cicd.local.key.pem"
 
 router:
   entrypoints:
