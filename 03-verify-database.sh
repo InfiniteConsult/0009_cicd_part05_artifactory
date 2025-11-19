@@ -13,7 +13,7 @@
 #
 #  What this script checks:
 #  1. Network connectivity to postgres.cicd.local.
-#  2. Strict SSL enforcement (sslmode=verify-full).
+#  2. Strict SSL enforcement (PGSSLMODE=verify-full).
 #  3. Negative Test: Ensures non-SSL connections are REJECTED.
 #  4. Authentication for all 4 service users.
 #  5. Authorization (Can they create tables in 'public'?).
@@ -61,16 +61,16 @@ verify_ssl_rejection() {
     # Use Artifactory creds for the test (User doesn't matter, connection type does)
     export PGPASSWORD="$ARTIFACTORY_DB_PASSWORD"
 
-    # Try to connect with SSL disabled.
-    # We explicitly want this command to FAIL.
-    # 2>&1 redirects stderr to stdout so we can grep it if needed, or just silence it.
+    # CRITICAL FIX: Use ENV variable, not --set
+    # We attempt to force a non-SSL connection.
+    export PGSSLMODE="disable"
 
+    # We explicitly want this command to FAIL.
     if psql \
         --host "postgres.cicd.local" \
         --username "artifactory" \
         --dbname "artifactory" \
         --no-password \
-        --set=sslmode=disable \
         --command "SELECT 1;" &> /dev/null; then
 
         echo " [FAIL] SECURITY BREACH! The database accepted a non-SSL connection."
@@ -79,6 +79,9 @@ verify_ssl_rejection() {
     else
         echo " [PASS] Connection rejected (Expected). The database correctly blocked non-SSL traffic."
     fi
+
+    # Unset the variable so it doesn't pollute later tests
+    unset PGSSLMODE
 }
 
 # --- 4. Positive Test: Functional Verification ---
@@ -95,16 +98,19 @@ verify_service_db() {
         return 1
     fi
 
-    # Run psql with strict SSL verification.
-    # The dev-container already trusts our CA via the OS store.
     export PGPASSWORD="$pass"
+    # CRITICAL FIXES:
+    # 1. Force strict verification
+    export PGSSLMODE="verify-full"
+    # 2. Tell libpq to look at the System Certificate Bundle (where your CA is)
+    #    Instead of looking in ~/.postgresql/root.crt
+    export PGSSLROOTCERT="/etc/ssl/certs/ca-certificates.crt"
 
     psql \
         --host "postgres.cicd.local" \
         --username "$user" \
         --dbname "$db" \
         --no-password \
-        --set=sslmode=verify-full \
         --set ON_ERROR_STOP=1 \
         <<-EOSQL
 
@@ -117,8 +123,6 @@ verify_service_db() {
         WHERE pid = pg_backend_pid();
 
         -- 2. Check PG17 Permissions (Create Table in Public)
-        -- If the 'GRANT CREATE ON SCHEMA public' failed in init.sh,
-        -- this statement will throw a permission denied error.
         CREATE TABLE public.verification_test (id int);
 
         -- 3. Cleanup
