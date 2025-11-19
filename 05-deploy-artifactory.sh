@@ -5,7 +5,11 @@
 #               05-deploy-artifactory.sh
 #
 #  This is the "Construction Crew" script.
-#  It launches the Artifactory container.
+#
+#  UPDATED:
+#  1. Version: 7.90.15 (Stable).
+#  2. Ports: 8081/8082 (HTTP).
+#  3. Fixes: --add-host localhost:127.0.0.1 (Fixes Login/Split-Brain).
 #
 # -----------------------------------------------------------
 
@@ -47,31 +51,29 @@ if [ "$(docker ps -aq -f name=artifactory)" ]; then
 fi
 
 # --- 4. Launch Container ---
-echo "Launching Artifactory OSS container..."
+echo "Launching Artifactory OSS container (v7.90.15)..."
 
-# Mount Fix Explanation:
-# 1. artifactory-data -> /var/opt/jfrog/artifactory
-#    This is the volume root. It contains 'data', 'etc', 'logs', etc.
-#
-# 2. $VAR_ETC -> /var/opt/jfrog/artifactory/etc
-#    We explicitly overlay ONLY the 'etc' directory.
-#    This puts system.yaml exactly where Artifactory looks for it.
+# Architecture Update:
+# --add-host: Forces localhost to IPv4. Fixes "dial tcp [::1]:8046: connection refused".
+# no_proxy: Prevents internal traffic from hitting host proxy.
 
 docker run -d \
   --name artifactory \
   --restart always \
   --network cicd-net \
   --hostname artifactory.cicd.local \
-  --publish 127.0.0.1:10500:10500 \
-  --publish 127.0.0.1:10501:10501 \
+  --publish 127.0.0.1:8082:8082 \
+  --publish 127.0.0.1:8081:8081 \
+  --env no_proxy="localhost,127.0.0.1,postgres.cicd.local,artifactory.cicd.local" \
+  --env NO_PROXY="localhost,127.0.0.1,postgres.cicd.local,artifactory.cicd.local" \
   --volume artifactory-data:/var/opt/jfrog/artifactory \
   --volume "$VAR_ETC":/var/opt/jfrog/artifactory/etc \
-  releases-docker.jfrog.io/jfrog/artifactory-oss:latest
+  releases-docker.jfrog.io/jfrog/artifactory-oss:7.90.15
 
 echo "Artifactory container started."
 echo "   This is a heavy Java application."
 echo "   It will take 1-2 minutes to initialize."
 echo "   Monitor logs with: docker logs -f artifactory"
 echo ""
-echo "   Look for: 'Artifactory Protocol (http) service is listening on port 10500'"
-echo "   Then access: https://artifactory.cicd.local:10500"
+echo "   Wait for: 'Router (jfrou) ... Listening on port: 8082'"
+echo "   Then access: http://artifactory.cicd.local:8082"
