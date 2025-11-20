@@ -6,10 +6,11 @@
 #
 #  This is the "Architect" script for Artifactory.
 #
-#  UPDATED STRATEGY (HTTP ONLY):
-#  1. Generates Secrets.
-#  2. Stages Root CA (For DB Trust).
-#  3. NO Router SSL (Standard HTTP).
+#  UPDATED:
+#  1. Generates 'artifactory.config.import.yml' to automate
+#     Base URL setup and repository creation.
+#  2. Uses standard ports 8081/8082.
+#  3. Cleaned up system.yaml.
 #
 # -----------------------------------------------------------
 
@@ -63,17 +64,12 @@ check_and_generate_secret "ARTIFACTORY_JOIN_KEY" "Artifactory Join Key" 16
 check_and_generate_secret "ARTIFACTORY_ADMIN_PASSWORD" "Artifactory Initial Admin Password" 16
 
 # --- 3. Directory Preparation ---
-# We clean up any old bootstrap keys to ensure HTTP mode
-if [ -d "$ARTIFACTORY_BASE/var/bootstrap" ]; then
-    echo "Cleaning up old bootstrap keys to force HTTP mode..."
-    rm -rf "$ARTIFACTORY_BASE/var/bootstrap"
-fi
-
 mkdir -p "$VAR_ETC/security/keys/trusted"
 mkdir -p "$VAR_ETC/access"
+# Create directory for the import config
+mkdir -p "$VAR_ETC/artifactory"
 
 # --- 4. Trust Staging ---
-# We still need the CA to trust the Postgres DB connection
 cp "$SRC_ROOT_CA" "$VAR_ETC/security/keys/trusted/ca.pem"
 echo "Root CA staged."
 
@@ -86,8 +82,30 @@ echo "admin@*=$ARTIFACTORY_ADMIN_PASSWORD" > "$VAR_ETC/access/bootstrap.creds"
 chmod 600 "$VAR_ETC/access/bootstrap.creds"
 echo "Secret files created."
 
-# --- 6. System Configuration (system.yaml) ---
-echo "--- Phase 5: Generating system.yaml ---"
+# --- 6. Bootstrap Configuration (Wizard Bypass) ---
+echo "--- Phase 5: Generating Bootstrap Config ---"
+IMPORT_FILE="$VAR_ETC/artifactory/artifactory.config.import.yml"
+
+# This file runs ONCE on clean install to set the Base URL
+# and create default repositories, skipping the UI wizard.
+cat << EOF > "$IMPORT_FILE"
+version: 1
+GeneralConfiguration:
+  # Must include port 8082 for standalone Docker!
+  baseUrl: "http://artifactory.cicd.local:8082"
+
+OnboardingConfiguration:
+  repoTypes:
+    - maven
+    - gradle
+    - docker
+    - pypi
+    - npm
+EOF
+echo "Bootstrap import file generated."
+
+# --- 7. System Configuration (system.yaml) ---
+echo "--- Phase 6: Generating system.yaml ---"
 SYSTEM_YAML="$VAR_ETC/system.yaml"
 
 cat << EOF > "$SYSTEM_YAML"
@@ -97,7 +115,7 @@ shared:
   node:
     ip: artifactory.cicd.local
 
-  # Fix internal connection issues (IPv4)
+  # IPv4 Fix for internal stability
   extraJavaOpts: "-Djava.net.preferIPv4Stack=true"
 
   database:
@@ -110,6 +128,6 @@ EOF
 
 echo "system.yaml generated."
 
-# --- 7. Final Permissions ---
+# --- 8. Final Permissions ---
 sudo chown -R 1030:1030 "$ARTIFACTORY_BASE"
 echo "--- Setup Complete ---"

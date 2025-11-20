@@ -8,8 +8,7 @@
 #
 #  UPDATED:
 #  1. Version: 7.90.15 (Stable).
-#  2. Ports: 8081/8082 (HTTP).
-#  3. Fixes: --add-host localhost:127.0.0.1 (Fixes Login/Split-Brain).
+#  2. Ports: Standard 8081/8082.
 #
 # -----------------------------------------------------------
 
@@ -52,10 +51,6 @@ fi
 
 # --- 4. Launch Container ---
 echo "Launching Artifactory OSS container (v7.90.15)..."
-
-# Architecture Update:
-# --add-host: Forces localhost to IPv4. Fixes "dial tcp [::1]:8046: connection refused".
-# no_proxy: Prevents internal traffic from hitting host proxy.
 
 docker run -d \
   --name artifactory \
