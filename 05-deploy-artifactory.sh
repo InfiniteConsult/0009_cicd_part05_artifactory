@@ -5,10 +5,12 @@
 #               05-deploy-artifactory.sh
 #
 #  This is the "Construction Crew" script.
+#  It launches the Artifactory container.
 #
 #  UPDATED:
-#  1. Version: 7.90.15 (Stable).
-#  2. Ports: Standard 8081/8082.
+#  1. Version 7.90.15.
+#  2. Maps 8443 -> 8443 (HTTPS).
+#  3. Maps 8082 -> 8082 (HTTP).
 #
 # -----------------------------------------------------------
 
@@ -52,13 +54,18 @@ fi
 # --- 4. Launch Container ---
 echo "Launching Artifactory OSS container (v7.90.15)..."
 
+# Architecture:
+# 8443: Tomcat HTTPS (Main UI/API Access)
+# 8082: Router HTTP (Internal Gateway)
+# Mount: 'etc' volume includes 'access/access.config.import.yml' for TLS setup
+
 docker run -d \
   --name artifactory \
   --restart always \
   --network cicd-net \
   --hostname artifactory.cicd.local \
+  --publish 127.0.0.1:8443:8443 \
   --publish 127.0.0.1:8082:8082 \
-  --publish 127.0.0.1:8081:8081 \
   --env no_proxy="localhost,127.0.0.1,postgres.cicd.local,artifactory.cicd.local" \
   --env NO_PROXY="localhost,127.0.0.1,postgres.cicd.local,artifactory.cicd.local" \
   --volume artifactory-data:/var/opt/jfrog/artifactory \
@@ -70,5 +77,4 @@ echo "   This is a heavy Java application."
 echo "   It will take 1-2 minutes to initialize."
 echo "   Monitor logs with: docker logs -f artifactory"
 echo ""
-echo "   Wait for: 'Router (jfrou) ... Listening on port: 8082'"
-echo "   Then access: http://artifactory.cicd.local:8082"
+echo "   Try accessing: https://artifactory.cicd.local:8443"

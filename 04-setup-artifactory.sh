@@ -6,11 +6,11 @@
 #
 #  This is the "Architect" script for Artifactory.
 #
-#  UPDATED:
-#  1. Generates 'artifactory.config.import.yml' to automate
-#     Base URL setup and repository creation.
-#  2. Uses standard ports 8081/8082.
-#  3. Cleaned up system.yaml.
+#  UPDATED STRATEGY: Internal TLS (Access as CA)
+#  1. Enable TLS in Access config.
+#  2. Enable HTTPS Connector in Artifactory config.
+#  3. Set Base URL to HTTPS port 8443.
+#  4. Standard PostgreSQL SSL & IPv4 fixes retained.
 #
 # -----------------------------------------------------------
 
@@ -22,7 +22,7 @@ ARTIFACTORY_BASE="$HOST_CICD_ROOT/artifactory"
 VAR_ETC="$ARTIFACTORY_BASE/var/etc"
 MASTER_ENV_FILE="$HOST_CICD_ROOT/cicd.env"
 
-# Certificate Source Paths
+# Certificate Source (Still needed for Database Trust)
 CA_DIR="$HOST_CICD_ROOT/ca"
 SRC_ROOT_CA="$CA_DIR/pki/certs/ca.pem"
 
@@ -66,10 +66,9 @@ check_and_generate_secret "ARTIFACTORY_ADMIN_PASSWORD" "Artifactory Initial Admi
 # --- 3. Directory Preparation ---
 mkdir -p "$VAR_ETC/security/keys/trusted"
 mkdir -p "$VAR_ETC/access"
-# Create directory for the import config
 mkdir -p "$VAR_ETC/artifactory"
 
-# --- 4. Trust Staging ---
+# --- 4. Trust Staging (DB Only) ---
 cp "$SRC_ROOT_CA" "$VAR_ETC/security/keys/trusted/ca.pem"
 echo "Root CA staged."
 
@@ -82,17 +81,23 @@ echo "admin@*=$ARTIFACTORY_ADMIN_PASSWORD" > "$VAR_ETC/access/bootstrap.creds"
 chmod 600 "$VAR_ETC/access/bootstrap.creds"
 echo "Secret files created."
 
-# --- 6. Bootstrap Configuration (Wizard Bypass) ---
-echo "--- Phase 5: Generating Bootstrap Config ---"
-IMPORT_FILE="$VAR_ETC/artifactory/artifactory.config.import.yml"
+# --- 6. Configuration Imports ---
 
-# This file runs ONCE on clean install to set the Base URL
-# and create default repositories, skipping the UI wizard.
-cat << EOF > "$IMPORT_FILE"
+# A. Access Config (Enable Internal TLS)
+ACCESS_IMPORT="$VAR_ETC/access/access.config.import.yml"
+cat << EOF > "$ACCESS_IMPORT"
+security:
+  tls: true
+EOF
+echo "Access config (TLS enabled) generated."
+
+# B. Artifactory Bootstrap (Base URL & Repos)
+ART_IMPORT="$VAR_ETC/artifactory/artifactory.config.import.yml"
+cat << EOF > "$ART_IMPORT"
 version: 1
 GeneralConfiguration:
-  # Must include port 8082 for standalone Docker!
-  baseUrl: "http://artifactory.cicd.local:8082"
+  # We point to the HTTPS port 8443
+  baseUrl: "https://artifactory.cicd.local:8443"
 
 OnboardingConfiguration:
   repoTypes:
@@ -102,10 +107,10 @@ OnboardingConfiguration:
     - pypi
     - npm
 EOF
-echo "Bootstrap import file generated."
+echo "Artifactory bootstrap config generated."
 
 # --- 7. System Configuration (system.yaml) ---
-echo "--- Phase 6: Generating system.yaml ---"
+echo "--- Phase 5: Generating system.yaml ---"
 SYSTEM_YAML="$VAR_ETC/system.yaml"
 
 cat << EOF > "$SYSTEM_YAML"
@@ -115,7 +120,7 @@ shared:
   node:
     ip: artifactory.cicd.local
 
-  # IPv4 Fix for internal stability
+  # IPv4 Fix
   extraJavaOpts: "-Djava.net.preferIPv4Stack=true"
 
   database:
@@ -124,6 +129,12 @@ shared:
     url: "jdbc:postgresql://postgres.cicd.local:5432/artifactory?sslmode=verify-full&sslrootcert=/var/opt/jfrog/artifactory/etc/security/keys/trusted/ca.pem"
     username: "artifactory"
     password: "${ARTIFACTORY_DB_PASSWORD}"
+
+artifactory:
+  tomcat:
+    httpsConnector:
+      enabled: true
+      port: 8443
 EOF
 
 echo "system.yaml generated."
