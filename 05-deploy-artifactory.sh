@@ -9,8 +9,8 @@
 #
 #  UPDATED:
 #  1. Version 7.90.15.
-#  2. Maps 8443 -> 8443 (HTTPS).
-#  3. Maps 8082 -> 8082 (HTTP).
+#  2. Ports 8443 (HTTPS) / 8082 (Router).
+#  3. Bootstrap Mount Enabled.
 #
 # -----------------------------------------------------------
 
@@ -20,6 +20,7 @@ set -e
 HOST_CICD_ROOT="$HOME/cicd_stack"
 ARTIFACTORY_BASE="$HOST_CICD_ROOT/artifactory"
 VAR_ETC="$ARTIFACTORY_BASE/var/etc"
+VAR_BOOTSTRAP="$ARTIFACTORY_BASE/var/bootstrap"
 
 SYSTEM_YAML="$VAR_ETC/system.yaml"
 MASTER_KEY="$VAR_ETC/security/master.key"
@@ -54,11 +55,6 @@ fi
 # --- 4. Launch Container ---
 echo "Launching Artifactory OSS container (v7.90.15)..."
 
-# Architecture:
-# 8443: Tomcat HTTPS (Main UI/API Access)
-# 8082: Router HTTP (Internal Gateway)
-# Mount: 'etc' volume includes 'access/access.config.import.yml' for TLS setup
-
 docker run -d \
   --name artifactory \
   --restart always \
@@ -70,6 +66,7 @@ docker run -d \
   --env NO_PROXY="localhost,127.0.0.1,postgres.cicd.local,artifactory.cicd.local" \
   --volume artifactory-data:/var/opt/jfrog/artifactory \
   --volume "$VAR_ETC":/var/opt/jfrog/artifactory/etc \
+  --volume "$VAR_BOOTSTRAP":/var/opt/jfrog/artifactory/bootstrap \
   releases-docker.jfrog.io/jfrog/artifactory-oss:7.90.15
 
 echo "Artifactory container started."
@@ -77,4 +74,5 @@ echo "   This is a heavy Java application."
 echo "   It will take 1-2 minutes to initialize."
 echo "   Monitor logs with: docker logs -f artifactory"
 echo ""
-echo "   Try accessing: https://artifactory.cicd.local:8443"
+echo "   Wait for: 'Router (jfrou) ... Listening on port: 8082'"
+echo "   Then access: https://artifactory.cicd.local:8443"
