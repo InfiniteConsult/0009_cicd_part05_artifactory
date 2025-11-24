@@ -1841,3 +1841,133 @@ If we try to configure the Jenkins Artifactory plugin to hunt down these files i
 Instead, we will adopt the **Staging Area** pattern. Before we trigger the upload, we will move all finished products into a single, clean directory named `dist/`. This decouples the *Build* logic from the *Publish* logic. The Artifactory plugin will have a single, simple instruction: "Upload everything in `dist/`."
 
 This completes our packaging theory. We are ready to implement the V2 Pipeline.
+
+# Chapter 8: Practical Application - The Pipeline V2
+
+## 8.1 The Evolution: From "Build" to "Deliver"
+
+We are now ready to upgrade our pipeline. Our V1 `Jenkinsfile` was a "Continuous Integration" (CI) pipeline; it verified that the code compiled and passed tests. Our V2 `Jenkinsfile` will be a "Continuous Delivery" (CD) pipeline; it will produce shipping-ready artifacts.
+
+To achieve this, we insert a new **Package** stage between "Test" and the final "Publish" step. This stage is responsible for executing the specific packaging commands we enabled in Chapter 7 (`cpack`, `cargo package`) and consolidating the outputs into our "Staging Area" (`dist/`).
+
+Open `0004_std_lib_http_client/Jenkinsfile` and insert the following stage after `Test & Coverage`:
+
+```groovy
+        stage('Package') {
+            steps {
+                echo '--- Packaging Artifacts ---'
+                
+                // 1. Create the "Staging Area"
+                // This is the single folder Artifactory will look at later.
+                sh 'mkdir -p dist'
+
+                // 2. Package C/C++ SDK (CPack)
+                // We must run inside 'build_release' because CPack relies on 
+                // the CMakeCache.txt generated during the build stage.
+                dir('build_release') {
+                    sh 'cpack -G TGZ -C Release'
+                    // Move the resulting tarball to our staging area
+                    sh 'mv *.tar.gz ../dist/'
+                }
+
+                // 3. Package Rust Crate
+                // We run inside the rust source directory.
+                dir('src/rust') {
+                    // This command generates the .crate file in target/package/
+                    sh 'cargo package'
+                    // Move it to the staging area
+                    sh 'cp target/package/*.crate ../../dist/'
+                }
+
+                // 4. Collect Python Wheel
+                // The wheel was already built by setup.sh in the earlier stage.
+                // We simply retrieve it from the wheelhouse.
+                sh 'cp build_release/wheelhouse/*.whl dist/'
+
+                // 5. Verification
+                // List the contents so we can see exactly what we are about to ship in the logs.
+                sh 'ls -l dist/'
+            }
+        }
+```
+
+### Deconstructing the Package Stage
+
+This stage is the implementation of our "Universal Bucket" strategy. It normalizes the chaos of our polyglot build system into a single, uniform directory.
+
+1.  **The Context Switch (`dir`):** Notice how we repeatedly use the `dir()` directive. This is crucial. `cpack` *must* run in the build directory to find its configuration. `cargo package` *must* run in the source directory to find `Cargo.toml`. The pipeline navigates the filesystem so the tools don't have to guess.
+2.  **The Consolidation:** Regardless of where the tool puts the file (`target/package`, `wheelhouse`), we forcefully move it to `dist/`. This means our subsequent "Publish" stage will never need to know about the internal structure of our build. It just needs to know about `dist/`.
+3.  **The Artifacts:** At the end of this stage, `dist/` will contain three files:
+    * `http-client-cpp-sdk-1.0.0-Linux.tar.gz`
+    * `httprust-0.1.0.crate`
+    * `httppy-0.1.0-py3-none-any.whl`
+
+## 8.2 The "Publish" Stage and the Syntax Traps
+
+With our artifacts neatly organized in the `dist/` directory, we can define the final stage of our pipeline: **Publish**.
+
+This stage uses the Artifactory Plugin to upload our files and, critically, publish the build metadata. However, configuring this step involves navigating three specific syntax traps that often trip up first-time users: **String Interpolation**, **Pattern Matching**, and **Silent Failures**.
+
+Here is the complete `Publish` stage. Add this to your `Jenkinsfile` immediately after the `Package` stage.
+
+```groovy
+        stage('Publish') {
+            steps {
+                echo '--- Publishing to Artifactory ---'
+                
+                // 1. Upload the Artifacts
+                rtUpload (
+                    // Use the ID 'artifactory' defined in our JCasC global config
+                    serverId: 'artifactory',
+                    
+                    // 2. The File Spec
+                    // We use Triple Double-Quotes (""") to allow variable interpolation
+                    spec: """{
+                          "files": [
+                            {
+                              "pattern": "dist/*", 
+                              "target": "generic-local/http-client/${BUILD_NUMBER}/",
+                              "flat": "true"
+                            }
+                          ]
+                    }""",
+                    
+                    // 3. The "Silent Failure" Fix
+                    // Force the build to fail if no files match the pattern
+                    failNoOp: true,
+                    
+                    // Associate files with this Jenkins Job
+                    buildName: "${JOB_NAME}",
+                    buildNumber: "${BUILD_NUMBER}"
+                )
+
+                // 4. Publish Build Info (The "Bill of Materials")
+                rtPublishBuildInfo (
+                    serverId: 'artifactory',
+                    buildName: "${JOB_NAME}",
+                    buildNumber: "${BUILD_NUMBER}"
+                )
+            }
+        }
+```
+
+### Deconstructing the Syntax Traps
+
+**1. The Interpolation Trap (`"""` vs `'''`)**
+In Jenkins Groovy, strings behave differently based on quotes.
+
+* `'''Triple Single Quotes'''`: Treat the string literally. If we used this, Jenkins would send the string `${BUILD_NUMBER}` to Artifactory as literal text, resulting in a folder named `${BUILD_NUMBER}` instead of `16`.
+* `"""Triple Double Quotes"""`: Enable **Variable Interpolation**. Jenkins replaces `${BUILD_NUMBER}` with the actual build number (e.g., `16`) *before* sending the command. This ensures our artifacts land in the correct versioned folder.
+
+**2. The Pattern Trap (Regex vs. Wildcards)**
+The Artifactory File Spec supports both Regex and Wildcards. Regex is powerful but fragile. During our testing, complex regex patterns like `dist/(.*)` failed to match files correctly without specific flags.
+We opted for the robust simplicity of **Wildcards**: `"pattern": "dist/*"`.
+Combined with `"flat": "true"`, this tells Artifactory: "Take every file inside `dist/`, ignore the folder structure, and upload them directly to the target path."
+
+**3. The "Silent Failure" Trap (`failNoOp`)**
+This is the most dangerous default behavior in the Artifactory plugin. By default, if your pattern (`dist/*`) matches **zero files** (perhaps because the package stage failed silently), the `rtUpload` step returns **SUCCESS**.
+This leads to "Green Builds" that delivered nothing—a phantom release.
+We explicitly set `failNoOp: true`. This forces the pipeline to turn **Red** (Failure) if it uploads nothing. This guarantees that a successful build actually indicates a successful delivery.
+
+**4. The "Chain of Custody" (`rtPublishBuildInfo`)**
+The final step, `rtPublishBuildInfo`, does not upload files. It uploads **Metadata**. It scrapes the Jenkins environment (Git Commit Hash, User, Timestamp, Dependencies) and creates a JSON manifest. It sends this manifest to Artifactory, atomically linking it to the files we just uploaded. This is what allows us to trace a binary back to the source code.
