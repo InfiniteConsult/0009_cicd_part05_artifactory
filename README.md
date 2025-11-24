@@ -1694,3 +1694,150 @@ This single green message confirms everything:
 * **Plugin Logic:** The `jfrogInstances` JCasC schema was parsed correctly.
 
 The "Factory" and the "Warehouse" are now connected.
+
+# Chapter 7: Packaging Theory - From "Binaries" to "Products"
+
+## 7.1 The Concept: A Binary is Not a Product
+
+We have connected our Factory to our Warehouse. We have a secure pipe ready to transport goods. But before we turn on the conveyor belt, we must ask a fundamental question: *what exactly are we shipping?*
+
+In our current V1 pipeline, our build script produces **Raw Binaries**: `libhttpc.so` and `libhttpcpp.so`.
+
+This leads to the **"Raw Binary" Trap**. A shared library file is useless on its own. If a developer downloads `libhttpc.so` from Artifactory, they cannot use it. They are missing the "Contract"—the C header files (`.h`) that define the API. Without the headers, the binary is a black box. Furthermore, they don't know if it was built for Debug or Release, or what dependencies it requires.
+
+To run a professional software supply chain, we must stop thinking in terms of *compiling binaries* and start thinking in terms of **packaging products**.
+
+We are building **Software Development Kits (SDKs)** and **Packages**. A "Product" is a self-contained, versioned, and consumable archive that a downstream developer can ingest without knowing or caring about how it was built.
+
+For our polyglot Hero Project, this means we need to produce three distinct, standardized formats:
+
+1.  **C & C++:** An **SDK Archive** (`.tar.gz`) containing both the "Implementation" (`lib/`) and the "Interface" (`include/`).
+2.  **Rust:** A **Standard Crate** (`.crate`) containing source code and metadata, ready for the Rust ecosystem.
+3.  **Python:** A **Binary Wheel** (`.whl`) containing pre-compiled bindings and metadata, ready for `pip`.
+
+We will now update our build systems to generate these packages natively.
+
+## 7.2 The C/C++ Strategy: The "SDK" Archive
+
+For our C and C++ artifacts, we will use **CPack**. CPack is bundled with CMake and is the industry standard for creating distribution packages.
+
+Instead of writing a fragile shell script in Jenkins to `cp` files into a temporary directory and `tar` them up, we define "Install Rules" directly in our `CMakeLists.txt`. This pushes the packaging logic down into the build system where it belongs, making it portable and reproducible on any machine (developer workstation or CI agent).
+
+We need to modify `0004_std_lib_http_client/CMakeLists.txt` in two places.
+
+**1. The GoogleTest Fix (The "Pollution" Trap)**
+During our initial packaging tests, we discovered that CPack was bundling `libgtest.a` and `libgmock.a` into our SDK. This is because GoogleTest defines its own install rules, and CPack grabs *everything*. We must explicitly disable this to keep our SDK clean.
+
+Locate the `FetchContent` block for GoogleTest and inject the `INSTALL_GTEST OFF` setting:
+
+```cmake
+FetchContent_Declare(
+        googletest
+        GIT_REPOSITORY https://github.com/google/googletest.git
+        GIT_TAG        v1.17.0
+)
+
+# --- FIX: Disable GTest Installation ---
+# Prevents test libraries from polluting our SDK package
+set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+
+FetchContent_MakeAvailable(googletest)
+```
+
+**2. The Packaging Logic**
+Append the following block to the very end of your `CMakeLists.txt`. This defines the layout of our SDK: headers go to `include/`, and binaries go to `lib/`.
+
+```cmake
+# --- Packaging Configuration (CPack) ---
+
+# 1. Define Install Rules
+# These tell CMake what files belong in the final package.
+
+# Install the compiled Shared Libraries (.so) into a 'lib/' folder
+install(TARGETS httpc_lib httpcpp_lib
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
+    RUNTIME DESTINATION bin
+)
+
+# Install the Public Headers into an 'include/' folder
+install(DIRECTORY include/ DESTINATION include)
+
+# 2. Configure the Package Metadata
+set(CPACK_PACKAGE_NAME "http-client-cpp-sdk")
+set(CPACK_PACKAGE_VENDOR "Warren Jitsing")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Multi-Language HTTP Client SDK (C/C++)")
+set(CPACK_PACKAGE_VERSION "1.0.0")
+set(CPACK_PACKAGE_CONTACT "warren.jitsing@infcon.co.za")
+
+# 3. Configure the Generator
+# We want a simple .tar.gz (TGZ) archive
+set(CPACK_GENERATOR "TGZ")
+
+# This must be the last command in the file
+include(CPack)
+```
+
+Now, running `cpack -G TGZ` will generate a standardized `http-client-cpp-sdk-1.0.0.tar.gz`.
+
+## 7.3 The Rust Strategy: The ".crate" Standard
+
+For our Rust implementation, the standard distribution format is the **Crate**. Unlike C++, where we often distribute pre-compiled binaries, the Rust ecosystem distributes *source code* bundled with a manifest (`Cargo.toml`). The consumer downloads the crate and compiles it locally, ensuring compatibility with their specific architecture and kernel.
+
+To create a standard crate, we use the `cargo package` command. This command creates a `.crate` file (which is essentially a tarball of the source) in `target/package/`.
+
+However, `cargo package` imposes a "Bureaucracy Check." It enforces strict metadata requirements to ensure the package is publishable to *crates.io* (or Artifactory). If your `Cargo.toml` is missing fields like `description`, `license`, or `repository`, the command will fail.
+
+We must update `src/rust/Cargo.toml` to satisfy these requirements and ensure our package name matches our library name standard.
+
+```toml
+[package]
+name = "httprust"
+version = "0.1.0"
+edition = "2021"
+# --- Metadata Required for Packaging ---
+description = "A standard library HTTP client implementation"
+license = "MIT"
+repository = "https://gitlab.cicd.local/Articles/0004_std_lib_http_client"
+authors = ["Warren Jitsing <warren.jitsing@infcon.co.za>"]
+
+[lib]
+name = "httprust"
+path = "src/lib.rs"
+
+[dependencies]
+libc = "0.2"
+reqwest = { version = "0.12.23", features = ["blocking"] }
+
+[[bin]]
+name = "httprust_client"
+path = "src/bin/httprust_client.rs"
+
+[[bin]]
+name = "reqwest_client"
+path = "src/bin/reqwest_client.rs"
+```
+
+## 7.4 The Python Strategy: The Binary Wheel
+
+For Python, the standard "Product" is the **Binary Wheel (`.whl`)**. This is a pre-compiled package that includes metadata and, crucially, any compiled C-extensions. It allows consumers to install the package via `pip` instantly without needing a compiler toolchain installed on their machine.
+
+Our `setup.sh` script already handles this. It uses the standard `build` module to generate the wheel.
+
+```bash
+# (From setup.sh)
+python3 -m build --wheel --outdir ${CMAKE_BINARY_DIR}/wheelhouse src/python
+```
+
+We do not need to change our build logic here; we simply need to know that our "Product" will be waiting for us in `build_release/wheelhouse/*.whl`.
+
+## 7.5 The "Staging Area" Pattern (`dist/`)
+
+We now have three different build systems (CMake, Cargo, Python Build) outputting artifacts to three different locations (`build_release/`, `src/rust/target/package/`, `build_release/wheelhouse/`).
+
+If we try to configure the Jenkins Artifactory plugin to hunt down these files individually, our pipeline code will become messy and fragile.
+
+Instead, we will adopt the **Staging Area** pattern. Before we trigger the upload, we will move all finished products into a single, clean directory named `dist/`. This decouples the *Build* logic from the *Publish* logic. The Artifactory plugin will have a single, simple instruction: "Upload everything in `dist/`."
+
+This completes our packaging theory. We are ready to implement the V2 Pipeline.
