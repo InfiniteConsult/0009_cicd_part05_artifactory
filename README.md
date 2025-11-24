@@ -760,3 +760,523 @@ This script requires a small "data bridging" step because the `dev-container` ca
 
 **The Result:**
 You will see `[PASS] Connection rejected` when the script attempts an insecure connection. You will then see `[PASS] SSL encryption verified` for every service user, confirming that your `init.sh` script successfully provisioned the multi-tenant architecture with the correct PostgreSQL 17 permissions.
+
+# Chapter 4: Action Plan (Part 2) - The Secure Warehouse
+
+## 4.1 The Architecture: A Cluster in a Container
+
+With our shared database layer operational, we turn our attention to the application itself. Deploying Artifactory 7.x is fundamentally different from deploying a standard web application like Jenkins. While Jenkins is a single process, Artifactory is a distributed system packaged into a single container. It consists of several distinct microservices—**Artifactory** (the core), **Access** (security), **Metadata**, **Router**, and **Frontend**—that must coordinate with one another to function.
+
+This microservice architecture necessitates a sophisticated internal trust model. We are not just managing a username and password; we are managing the cryptographic trust root for a cluster.
+
+To secure this "Cluster in a Container," we must explicitly manage two critical cryptographic assets:
+
+1.  **The Master Key:** This is an AES-256 key used for **Data at Rest** encryption. Artifactory uses this to encrypt sensitive data within the configuration files (like the database password we just generated) and inside the database itself. If you lose this key, the data is cryptographically locked forever.
+2.  **The Join Key:** This is a shared secret used for **Data in Motion** trust. When the internal microservices (like Metadata or Access) start up, they use this key to "handshake" with one another and establish a circle of trust. Once trusted, they exchange short-lived tokens for API access.
+
+In a default installation, Artifactory generates these keys automatically on the first run. However, relying on auto-generation creates a "Black Box" deployment where we do not possess the recovery keys for our own infrastructure. It also introduces potential race conditions during the initial boot where services might time out waiting for key generation.
+
+We will define these keys manually on the host *before* the container starts. By generating high-entropy keys ourselves, we ensure we own the "Root of Trust" for our warehouse from the very first second.
+
+## 4.2 The Architect (`04-setup-artifactory.sh`)
+
+To orchestrate this complex internal environment, we need a robust Architect script. This script is responsible for generating the Master and Join keys, creating the specific directory structure required for the bootstrap process, and—most critically—generating the "Strict Compliance" TLS certificates required by the Artifactory Router.
+
+Create this file at `~/cicd_stack/artifactory/04-setup-artifactory.sh`.
+
+```bash
+#!/usr/bin/env bash
+
+#
+# -----------------------------------------------------------
+#               04-setup-artifactory.sh
+#
+#  This is the "Architect" script for Artifactory.
+#
+#  UPDATED: "Docs Compliance Mode"
+#  1. Generates Certificate with clientAuth + Critical KeyUsage.
+#  2. Sets shared.node.ip to match Certificate CN.
+#  3. Uses Bootstrap mechanism for SSL ingest.
+#
+# -----------------------------------------------------------
+
+set -e
+
+# --- 1. Define Paths ---
+HOST_CICD_ROOT="$HOME/cicd_stack"
+ARTIFACTORY_BASE="$HOST_CICD_ROOT/artifactory"
+VAR_ETC="$ARTIFACTORY_BASE/var/etc"
+VAR_BOOTSTRAP="$ARTIFACTORY_BASE/var/bootstrap"
+MASTER_ENV_FILE="$HOST_CICD_ROOT/cicd.env"
+
+# CA Paths
+CA_DIR="$HOST_CICD_ROOT/ca"
+CA_CERT="$CA_DIR/pki/certs/ca.pem"
+CA_KEY="$CA_DIR/pki/private/ca.key"
+CA_PASSWORD="your_secure_password"
+
+echo "Starting Artifactory 'Architect' Setup..."
+
+# --- 2. Secrets Management ---
+if [ ! -f "$MASTER_ENV_FILE" ]; then
+    echo "ERROR: Master env file not found at $MASTER_ENV_FILE"
+    exit 1
+fi
+source "$MASTER_ENV_FILE"
+
+if [ -z "$ARTIFACTORY_DB_PASSWORD" ]; then
+    echo "ERROR: ARTIFACTORY_DB_PASSWORD not found in cicd.env"
+    echo "Please run 01-setup-database.sh first."
+    exit 1
+fi
+
+check_and_generate_secret() {
+    local var_name=$1
+    local var_value=${!var_name}
+    local description=$2
+    local length=$3 # bytes
+
+    if [ -z "$var_value" ]; then
+        echo "Generating new $description ($var_name)..."
+        local new_secret=$(openssl rand -hex $length)
+        echo "" >> "$MASTER_ENV_FILE"
+        echo "# $description" >> "$MASTER_ENV_FILE"
+        echo "$var_name=\"$new_secret\"" >> "$MASTER_ENV_FILE"
+        export $var_name="$new_secret"
+    else
+        echo "Found existing $var_name."
+    fi
+}
+
+check_and_generate_secret "ARTIFACTORY_MASTER_KEY" "Artifactory Master Key" 32
+check_and_generate_secret "ARTIFACTORY_JOIN_KEY" "Artifactory Join Key" 16
+check_and_generate_secret "ARTIFACTORY_ADMIN_PASSWORD" "Artifactory Initial Admin Password" 16
+
+# --- 3. Directory Preparation ---
+mkdir -p "$VAR_ETC/security/keys/trusted"
+mkdir -p "$VAR_ETC/access"
+mkdir -p "$VAR_ETC/artifactory"
+mkdir -p "$VAR_BOOTSTRAP/router/keys"
+
+# --- 4. Strict Certificate Generation ---
+echo "--- Phase 3: Generating Strict Compliance Certificate ---"
+
+ROUTER_CERT_DIR="$VAR_BOOTSTRAP/router/keys"
+ROUTER_KEY="$ROUTER_CERT_DIR/custom-server.key"
+ROUTER_CSR="$ROUTER_CERT_DIR/custom-server.csr"
+ROUTER_CRT="$ROUTER_CERT_DIR/custom-server.crt"
+ROUTER_CNF="$ROUTER_CERT_DIR/router.cnf"
+
+# 1. Generate Private Key
+openssl genrsa -out "$ROUTER_KEY" 4096
+chmod 600 "$ROUTER_KEY"
+
+# 2. Create OpenSSL Config (The Requirements from Docs)
+cat > "$ROUTER_CNF" <<EOF
+[req]
+default_bits = 4096
+prompt = no
+default_md = sha256
+distinguished_name = dn
+req_extensions = v3_req
+
+[dn]
+C=ZA
+ST=Gauteng
+L=Johannesburg
+O=Local CICD Stack
+CN=artifactory.cicd.local
+
+[v3_req]
+# REQ 1: Key usage extension must be marked CRITICAL
+# REQ 2: digitalSignature + keyEncipherment must be enabled
+keyUsage = critical, digitalSignature, keyEncipherment
+
+# REQ 3: Extended key usage tlsWebServerAuthentication + tlsWebClientAuthentication
+extendedKeyUsage = serverAuth, clientAuth
+
+basicConstraints = critical, CA:FALSE
+subjectAltName = @alt_names
+
+[alt_names]
+# REQ 4: SANs must include the subject (CN)
+DNS.1 = artifactory.cicd.local
+DNS.2 = localhost
+IP.1 = 127.0.0.1
+EOF
+
+# 3. Generate CSR
+openssl req -new -key "$ROUTER_KEY" -out "$ROUTER_CSR" -config "$ROUTER_CNF"
+
+# 4. Sign with Root CA
+openssl x509 -req -in "$ROUTER_CSR" \
+    -CA "$CA_CERT" -CAkey "$CA_KEY" \
+    -CAcreateserial -out "$ROUTER_CRT" \
+    -days 365 \
+    -sha256 \
+    -extensions v3_req -extfile "$ROUTER_CNF" \
+    -passin pass:$CA_PASSWORD
+
+# Cleanup
+rm "$ROUTER_CSR" "$ROUTER_CNF"
+chmod 644 "$ROUTER_CRT"
+echo "Compliant Certificate generated."
+
+# --- 5. Trust Staging ---
+# Docs: "Copy the CA of the custom TLS certificate in etc/security/keys/trusted/"
+cp "$CA_CERT" "$VAR_ETC/security/keys/trusted/ca.pem"
+echo "Root CA staged."
+
+# --- 6. Secret File Generation ---
+echo -n "$ARTIFACTORY_MASTER_KEY" > "$VAR_ETC/security/master.key"
+chmod 600 "$VAR_ETC/security/master.key"
+echo -n "$ARTIFACTORY_JOIN_KEY" > "$VAR_ETC/security/join.key"
+chmod 600 "$VAR_ETC/security/join.key"
+echo "admin@*=$ARTIFACTORY_ADMIN_PASSWORD" > "$VAR_ETC/access/bootstrap.creds"
+chmod 600 "$VAR_ETC/access/bootstrap.creds"
+echo "Secret files created."
+
+# --- 7. Configuration Imports ---
+
+# A. Access Config (Enable TLS)
+ACCESS_IMPORT="$VAR_ETC/access/access.config.import.yml"
+cat << EOF > "$ACCESS_IMPORT"
+security:
+  tls: true
+EOF
+
+# B. Artifactory Config (Base URL)
+ART_IMPORT="$VAR_ETC/artifactory/artifactory.config.import.yml"
+cat << EOF > "$ART_IMPORT"
+version: 1
+GeneralConfiguration:
+  # We point to the HTTPS port 8443
+  baseUrl: "https://artifactory.cicd.local:8443"
+
+OnboardingConfiguration:
+  repoTypes:
+    - maven
+    - gradle
+    - docker
+    - pypi
+    - npm
+EOF
+
+# --- 8. System Configuration (system.yaml) ---
+echo "--- Phase 5: Generating system.yaml ---"
+SYSTEM_YAML="$VAR_ETC/system.yaml"
+
+cat << EOF > "$SYSTEM_YAML"
+configVersion: 1
+
+shared:
+  # REQ 5: The certificate's subject must match the property shared.node.ip
+  node:
+    ip: artifactory.cicd.local
+
+  # IPv4 Fix (Still required for Docker stability)
+  extraJavaOpts: "-Djava.net.preferIPv4Stack=true"
+
+  database:
+    type: postgresql
+    driver: org.postgresql.Driver
+    url: "jdbc:postgresql://postgres.cicd.local:5432/artifactory?sslmode=verify-full&sslrootcert=/var/opt/jfrog/artifactory/etc/security/keys/trusted/ca.pem"
+    username: "artifactory"
+    password: "${ARTIFACTORY_DB_PASSWORD}"
+
+artifactory:
+  tomcat:
+    httpsConnector:
+      enabled: true
+      port: 8443
+      # We do not specify file paths. We rely on Bootstrap to import them
+      # into the internal keystore.
+EOF
+
+echo "system.yaml generated."
+
+# --- 9. Final Permissions ---
+sudo chown -R 1030:1030 "$ARTIFACTORY_BASE"
+echo "--- Setup Complete ---"
+```
+
+### Deconstructing the Architect
+
+**1. The "Strict Compliance" Certificate**
+This section is the solution to the "Go vs. OpenSSL" conflict we identified in the architectural phase.
+
+* **The Config:** We create a temporary `router.cnf` file.
+* **`keyUsage = critical`**: This line is non-negotiable. It satisfies the strict RFC 5280 requirement of the Go crypto library.
+* **`extendedKeyUsage = serverAuth, clientAuth`**: This handles the dual role of the Router. It serves the browser (`serverAuth`) and connects to internal services (`clientAuth`). Without this dual designation, the internal mTLS handshake would fail, and the Router would crash.
+
+**2. Fixing "Split Brain" Networking (`extraJavaOpts`)**
+In the `system.yaml` generation block, we inject `extraJavaOpts: "-Djava.net.preferIPv4Stack=true"`.
+This prevents a common Docker networking issue. The JVM (Tomcat) often attempts to bind to IPv6 (`::1`) by default, while the Go Router attempts to connect via IPv4 (`127.0.0.1`). This mismatch causes "Connection Refused" errors on `localhost`. By forcing the JVM to use the IPv4 stack, we align the internal protocols.
+
+**3. The "Bootstrap" Pattern (`config.import.yml`)**
+We use a powerful Artifactory feature called "Configuration Import."
+Instead of clicking through the "Welcome Wizard" manually, we write our desired state to `artifactory.config.import.yml` and `access.config.import.yml`. Artifactory detects these files on boot, ingests the configuration (setting the Base URL to `https://artifactory.cicd.local:8443`), enables TLS for the Access service, and then deletes the files. This turns the interactive setup process into immutable Infrastructure-as-Code.
+
+**4. Permission Management (`chown 1030`)**
+Just as we handled UID 999 for Postgres, we handle **UID 1030** for Artifactory. The container runs as a non-root user. We must ensure that the configuration directories we just created on the host are readable and writable by this specific internal user ID, or the container will crash with a `Permission Denied` error.
+
+## 4.3 The Launcher (`05-deploy-artifactory.sh`)
+
+With our filesystem prepared and our certificates minted, we are ready to launch the container. This script is the "Construction Crew." It takes the assets prepared by the Architect and brings the application to life.
+
+This script also addresses two specific runtime environment challenges: **Version Stability** and the **Proxy Trap**.
+
+Create this file at `~/cicd_stack/artifactory/05-deploy-artifactory.sh`.
+
+```bash
+#!/usr/bin/env bash
+
+#
+# -----------------------------------------------------------
+#               05-deploy-artifactory.sh
+#
+#  This is the "Construction Crew" script.
+#  It launches the Artifactory container.
+#
+#  UPDATED:
+#  1. Version 7.90.15.
+#  2. Ports 8443 (HTTPS) / 8082 (Router).
+#  3. Bootstrap Mount Enabled.
+#
+# -----------------------------------------------------------
+
+set -e
+
+# --- 1. Define Paths ---
+HOST_CICD_ROOT="$HOME/cicd_stack"
+ARTIFACTORY_BASE="$HOST_CICD_ROOT/artifactory"
+VAR_ETC="$ARTIFACTORY_BASE/var/etc"
+VAR_BOOTSTRAP="$ARTIFACTORY_BASE/var/bootstrap"
+
+SYSTEM_YAML="$VAR_ETC/system.yaml"
+MASTER_KEY="$VAR_ETC/security/master.key"
+JOIN_KEY="$VAR_ETC/security/join.key"
+
+echo "Starting Artifactory Deployment..."
+
+# --- 2. Prerequisite Checks ---
+if [ ! -f "$SYSTEM_YAML" ]; then
+    echo "ERROR: system.yaml not found. Run 04-setup-artifactory.sh first."
+    exit 1
+fi
+if [ ! -f "$MASTER_KEY" ]; then
+    echo "ERROR: master.key not found. Run 04-setup-artifactory.sh first."
+    exit 1
+fi
+if [ ! -f "$JOIN_KEY" ]; then
+    echo "ERROR: join.key not found. Run 04-setup-artifactory.sh first."
+    exit 1
+fi
+
+# --- 3. Clean Slate Protocol ---
+if [ "$(docker ps -q -f name=artifactory)" ]; then
+    echo "Stopping existing 'artifactory' container..."
+    docker stop artifactory
+fi
+if [ "$(docker ps -aq -f name=artifactory)" ]; then
+    echo "Removing existing 'artifactory' container..."
+    docker rm artifactory
+fi
+
+# --- 4. Launch Container ---
+echo "Launching Artifactory OSS container (v7.90.15)..."
+
+docker run -d \
+  --name artifactory \
+  --restart always \
+  --network cicd-net \
+  --hostname artifactory.cicd.local \
+  --publish 127.0.0.1:8443:8443 \
+  --publish 127.0.0.1:8082:8082 \
+  --env no_proxy="localhost,127.0.0.1,postgres.cicd.local,artifactory.cicd.local" \
+  --env NO_PROXY="localhost,127.0.0.1,postgres.cicd.local,artifactory.cicd.local" \
+  --volume artifactory-data:/var/opt/jfrog/artifactory \
+  --volume "$VAR_ETC":/var/opt/jfrog/artifactory/etc \
+  --volume "$VAR_BOOTSTRAP":/var/opt/jfrog/artifactory/bootstrap \
+  releases-docker.jfrog.io/jfrog/artifactory-oss:7.90.15
+
+echo "Artifactory container started."
+echo "   This is a heavy Java application."
+echo "   It will take 1-2 minutes to initialize."
+echo "   Monitor logs with: docker logs -f artifactory"
+echo ""
+echo "   Wait for: 'Router (jfrou) ... Listening on port: 8082'"
+echo "   Then access: https://artifactory.cicd.local:8443"
+```
+
+### Deconstructing the Launcher
+
+**1. Version Pinning (`7.90.15`)**
+We are explicitly pinning the image to version `7.90.15`. In the world of Enterprise Java applications, "latest" is a dangerous tag. We discovered during development that newer versions (v7.90.20+) introduced a race condition where the Frontend (`jffe`) service would crash before the Router was fully initialized, sending the container into a boot loop. By pinning to a known-good version, we ensure stability.
+
+**2. The "Proxy Trap" (`no_proxy`)**
+This is a critical fix for corporate or complex network environments.
+If your host machine defines `HTTP_PROXY` variables (common in office environments), Docker containers inherit them by default. This creates a routing disaster: when the internal Router tries to talk to the internal Metadata service on `localhost:8081`, the Go HTTP client sees the proxy variable and attempts to route that request *out* to the corporate proxy server. The proxy server, having no idea what "localhost" inside your container refers to, rejects the connection.
+By injecting `no_proxy="localhost,127.0.0.1,..."`, we explicitly tell the internal services to bypass the proxy and communicate directly for local addresses.
+
+**3. The Hybrid Mounts**
+We mount our three persistence layers:
+
+* `artifactory-data`: The Docker volume for the massive binary blobs.
+* `etc`: The host directory containing our keys and `system.yaml`.
+* `bootstrap`: The host directory containing our certificates and config import files.
+  This structure allows us to "seed" the configuration from the host while keeping the heavy data storage managed by Docker.
+
+## 4.4 Verification (`06-verify-artifactory.py`)
+
+With the container running, we need to verify that the internal "City" is actually functioning. Because Artifactory is a mesh of microservices, a simple "container running" status is insufficient. The container might be up, but the Router could be failing to talk to the Metadata service, or the Database connection might be hanging.
+
+We will use a Python script to perform a "pulse check" on the system. This script hits specific health endpoints that aggregate the status of the internal components. It also attempts to verify our administrative access, though we expect that part to skip until we perform our manual UI setup in the next chapter.
+
+Create this file at `~/Documents/FromFirstPrinciples/articles/0009_cicd_part05_artifactory/06-verify-artifactory.py`.
+
+```python
+#!/usr/bin/env python3
+
+import os
+import ssl
+import urllib.request
+import urllib.error
+import json
+import sys
+from pathlib import Path
+
+# --- Configuration ---
+ENV_FILE_PATH = Path.home() / "cicd_stack" / "cicd.env"
+BASE_URL = "https://artifactory.cicd.local:8082"
+
+# Endpoints
+HEALTH_ENDPOINT = f"{BASE_URL}/router/api/v1/system/health"
+PING_ENDPOINT = f"{BASE_URL}/artifactory/api/system/ping"
+# We use the endpoint you confirmed works with your token
+TOKEN_LIST_ENDPOINT = f"{BASE_URL}/access/api/v1/tokens"
+
+def load_env(env_path):
+    if not env_path.exists():
+        print(f"[FAIL] Configuration error: {env_path} not found.")
+        return False
+
+    with open(env_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#') and '=' in line:
+                key, value = line.split('=', 1)
+                os.environ[key.strip()] = value.strip().strip('"\'')
+    return True
+
+def get_ssl_context():
+    # Trusts the system CA store (where our Root CA lives)
+    return ssl.create_default_context()
+
+def print_response_error(response):
+    """Helper to print the full error body for debugging"""
+    try:
+        body = response.read().decode()
+        print(f"       [SERVER RESPONSE]: {body}")
+    except Exception:
+        print("       [SERVER RESPONSE]: (Could not decode body)")
+
+def check_health():
+    print(f"\n--- Test 1: Router Health (Unauthenticated) ---")
+    print(f"GET {HEALTH_ENDPOINT}")
+
+    ctx = get_ssl_context()
+    try:
+        req = urllib.request.Request(HEALTH_ENDPOINT)
+        with urllib.request.urlopen(req, context=ctx) as response:
+            if response.status == 200:
+                data = json.loads(response.read().decode())
+                state = data.get('router', {}).get('state', 'UNKNOWN')
+                print(f"[PASS] Status: 200 OK")
+                print(f"       Router State: {state}")
+            else:
+                print(f"[FAIL] Status: {response.status}")
+                print_response_error(response)
+    except urllib.error.HTTPError as e:
+        print(f"[FAIL] HTTP {e.code}: {e.reason}")
+        print_response_error(e)
+    except Exception as e:
+        print(f"[FAIL] {e}")
+
+def check_ping():
+    print(f"\n--- Test 2: System Ping (Unauthenticated) ---")
+    print(f"GET {PING_ENDPOINT}")
+
+    ctx = get_ssl_context()
+    try:
+        req = urllib.request.Request(PING_ENDPOINT)
+        with urllib.request.urlopen(req, context=ctx) as response:
+            body = response.read().decode().strip()
+            if response.status == 200 and body == "OK":
+                print(f"[PASS] Status: 200 OK")
+                print(f"       Response: {body}")
+            else:
+                print(f"[FAIL] Unexpected response: {body}")
+    except urllib.error.HTTPError as e:
+        print(f"[FAIL] HTTP {e.code}: {e.reason}")
+        print_response_error(e)
+    except Exception as e:
+        print(f"[FAIL] {e}")
+
+def check_admin_token():
+    print(f"\n--- Test 3: Admin Token Verification ---")
+    print(f"GET {TOKEN_LIST_ENDPOINT}")
+
+    token = os.getenv("ARTIFACTORY_ADMIN_TOKEN")
+    if not token:
+        print("[SKIP] ARTIFACTORY_ADMIN_TOKEN not found in cicd.env")
+        return
+
+    # We use the Bearer header as confirmed by the search AI
+    headers = {"Authorization": f"Bearer {token}"}
+    ctx = get_ssl_context()
+
+    try:
+        req = urllib.request.Request(TOKEN_LIST_ENDPOINT, headers=headers)
+        with urllib.request.urlopen(req, context=ctx) as response:
+            if response.status == 200:
+                data = json.loads(response.read().decode())
+                tokens = data.get('tokens', [])
+                print(f"[PASS] Status: 200 OK")
+                print(f"       Admin Access Confirmed.")
+                print(f"       Visible Tokens: {len(tokens)}")
+                if len(tokens) > 0:
+                    print(f"       First Token ID: {tokens[0].get('token_id')}")
+            else:
+                print(f"[FAIL] Status: {response.status}")
+                print_response_error(response)
+    except urllib.error.HTTPError as e:
+        print(f"[FAIL] HTTP {e.code}: {e.reason}")
+        print_response_error(e)
+        if e.code == 403:
+            print("       (Token is valid but lacks permission to list tokens)")
+        if e.code == 401:
+            print("       (Token is invalid or expired)")
+    except Exception as e:
+        print(f"[FAIL] {e}")
+
+if __name__ == "__main__":
+    if load_env(ENV_FILE_PATH):
+        check_health()
+        check_ping()
+        check_admin_token()
+        print("\n--- Verification Complete ---")
+```
+
+### Running the Verification
+
+Unlike the database audit, we can run this script directly from the **Host**, provided you have Python 3 installed. We want to prove that our host machine—which will act as the developer workstation—can trust the Artifactory SSL certificate.
+
+```bash
+# On the Host Machine
+cd ~/Documents/FromFirstPrinciples/articles/0009_cicd_part05_artifactory
+chmod +x 06-verify-artifactory.py
+./06-verify-artifactory.py
+```
+
+You should see `[PASS]` for the Router Health and System Ping. The Admin Token verification will currently `[SKIP]`. This is expected; we have the infrastructure running, but we haven't yet logged in to generate the keys for the castle. We will handle that next.
