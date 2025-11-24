@@ -1280,3 +1280,107 @@ chmod +x 06-verify-artifactory.py
 ```
 
 You should see `[PASS]` for the Router Health and System Ping. The Admin Token verification will currently `[SKIP]`. This is expected; we have the infrastructure running, but we haven't yet logged in to generate the keys for the castle. We will handle that next.
+
+
+# Chapter 5: UI Configuration - Opening the Warehouse
+
+## 5.1 First Login & The "Wizard Bypass"
+
+The infrastructure is live. We have a running database, a secure microservice mesh, and a listening web server. Now, we verify the user experience.
+
+Open your browser on your host machine and navigate to:
+
+**`https://artifactory.cicd.local:8443`**
+
+Because we meticulously established our Public Key Infrastructure in Article 2 and imported the Root CA into our host's trust store, the page should load immediately with a secure lock icon. There are no "Your connection is not private" warnings to click through.
+
+You will be greeted by the JFrog login screen. To log in, use the credentials we generated in our `01-setup-database.sh` script.
+
+* **Username:** `admin`
+* **Password:** Open your `~/cicd_stack/cicd.env` file and copy the value of `ARTIFACTORY_ADMIN_PASSWORD`.
+
+### The "Wizard Bypass"
+
+Upon logging in, you might expect to see a "Welcome Wizard" asking you to accept terms, set a Base URL, and create default repositories.
+
+You will not see this. You will be taken directly to the main dashboard.
+
+This is the payoff for the `artifactory.config.import.yml` file we injected during the setup phase. By defining our desired state (Base URL and Repository Types) in code and bootstrapping it into the container, we have effectively "skipped" the manual onboarding process. This is a critical pattern for "Infrastructure as Code"—we treat the application configuration just like the server configuration.
+
+To verify this, navigate to **Administration** (on the top menu) -> **General Management** -> **Settings**. You will see that the **Custom Base URL** is already correctly set to `https://artifactory.cicd.local:8443`.
+
+## 5.2 Creating the Admin Token (The Integration Key)
+
+Now that we are logged in, we need to generate the credentials that Jenkins will use. We cannot simply give Jenkins our admin password. Modern CI/CD best practices dictate the use of **Access Tokens**, which provide better auditability and can be revoked without changing the root password.
+
+Specifically, we need a **Global Admin Token**. As we discovered in our research, Artifactory 7.x distinguishes between "Project Admin" tokens (which are sandboxed to specific projects) and "Global" tokens. Since Jenkins acts as the orchestrator for our entire city—publishing global Build Info metadata and interacting with the system APIs—it requires an Admin-scoped token.
+
+Here is the procedure to generate the correct token:
+
+1.  Navigate to **Administration** (top menu) -\> **User Management** -\> **Access Tokens**.
+2.  Click the **"Generate Token"** button.
+3.  **Token Type:** Select **"Scoped Token"**.
+4.  **Token Scope:** Select **"Admin"**. This ensures the token inherits the full administrative power required for global operations.
+5.  **User Name:** Enter `admin`.
+6.  **Service:** Click the **"All"** checkbox. (Note: In the OSS version, "Artifactory" is likely the only service listed, but checking "All" ensures forward compatibility).
+7.  **Expiration Time:** Set to **"Never"** for the purpose of this lab. In a production environment, you would set a rotation policy here.
+8.  Click **"Generate"**.
+
+You will be presented with a `Reference Token` (a short string) and an `Access Token` (a very long JWT string). **Copy the long Access Token immediately.** You will not be able to see it again once you close this window.
+
+### Updating the Secrets File
+
+We must now save this token to our master secrets file so our automation scripts can use it.
+
+On your host machine, open `~/cicd_stack/cicd.env` and add the following line:
+
+```bash
+ARTIFACTORY_ADMIN_TOKEN="<paste_your_long_token_here>"
+```
+
+This token is the "Key to the Warehouse." It will allow our `07-update-jenkins.sh` script to securely inject credentials into the Jenkins container in the next chapter.
+
+## 5.3 Creating the Repository (`generic-local`)
+
+With our admin token secured, we need to prepare the "Landing Zone" for our artifacts.
+
+Recall that in our `artifactory.config.import.yml` bootstrap file, we defined several default repository types (`maven`, `gradle`, `docker`, `npm`). However, we intentionally omitted the **Generic** type. This highlights a key architectural distinction: while package-specific repositories (like Maven) come with complex indexing and metadata rules, a Generic repository is essentially a smart file system.
+
+Because we didn't bootstrap it, we must create it manually. This will be the destination for our C++ SDKs, Rust Crates, and Python Wheels.
+
+1.  Navigate to **Administration** -\> **Repositories**.
+2.  Click the **"Create Repository"** button in the top right.
+3.  Select **"Local"**. We want a repository that stores files on our own disk (in the PostgreSQL metadata / Docker Volume blob store), not a proxy to a remote URL.
+4.  Select **"Generic"** as the package type.
+5.  **Repository Key:** Enter `generic-local`.
+6.  Click **"Create Local Repository"**.
+
+We now have an empty storage bucket. Unlike the "Filing Cabinet" (Git), this "Warehouse" doesn't care about diffs or merge conflicts. It simply accepts binary blobs and stores them forever.
+
+### A Note on Layouts
+
+By default, a Generic repository treats paths literally. When we configure our pipeline later to upload to `http-client/16/`, Artifactory will simply create a folder named `http-client` and a subfolder named `16`.
+
+It is important to understand that Artifactory does not automatically know that "16" is a version number. In a more advanced setup, we would apply a **Custom Repository Layout** (using Regex) to teach Artifactory how to parse our folder structure (e.g., `[org]/[module]/[baseRev]`). For our current needs, the physical folder structure is sufficient organization.
+
+## 5.4 The "Set Me Up" Experience (Developer Productivity)
+
+Before we leave the UI, we should verify that our repository is accessible to developers. One of the primary benefits of using an Artifact Manager over a simple file server is the **Developer Experience (DX)**.
+
+In the **Application** module (top menu), navigate to **Artifactory** -\> **Artifacts**. Select your new `generic-local` repository in the tree view.
+
+Click the **"Set Me Up"** button in the top right corner.
+
+Artifactory will dynamically generate the exact commands a developer needs to interact with this repository. Because we correctly configured our Base URL (`https://artifactory.cicd.local:8443`) and our SSL certificates, the command provided will be production-ready:
+
+```bash
+curl -uadmin:<TOKEN> -T <PATH_TO_FILE> "https://artifactory.cicd.local:8443/artifactory/generic-local/<TARGET_FILE_PATH>"
+```
+
+This validates our entire networking stack. It confirms that:
+
+1.  The system knows its own external DNS name (`artifactory.cicd.local`).
+2.  It knows it is serving HTTPS on port 8443.
+3.  It is ready to accept uploads.
+
+This is the "Warehouse" equivalent of a loading dock with clear signage. We don't force developers to guess the URL structure; we provide it.
