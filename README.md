@@ -60,3 +60,73 @@ GitLab Releases are designed for humans; they provide download links. Artifactor
 
 We need to capture more than just the file. We need to capture the **context**. The Build Info object links the specific SHA256 checksum of a binary back to the Git Commit hash, the Jenkins Build ID, the environment variables, and the dependencies used to create it. This creates a "Chain of Custody" that turns a random file into a trusted supply chain asset.
 
+# Chapter 2: The Architecture - Designing the Warehouse
+
+## 2.1 The Database Pivot: "City Infrastructure" vs. "Private Utilities"
+
+Before we can deploy the Artifactory container, we must make a fundamental architectural decision regarding its data storage. Unlike Jenkins, which stores its configuration and job history as flat XML files on the filesystem, Artifactory relies heavily on a transactional database to manage metadata, security tokens, and package indexing.
+
+By default, Artifactory ships with an embedded Apache Derby database. This is designed for "zero-config" trials: you run the container, the database spins up inside the same JVM process, and the application starts. While convenient for a five-minute test, this "Private Utility" model is architecturally unsound for a persistent, professional environment.
+
+The embedded database introduces significant risks. It runs within the application container, meaning if the container crashes or is killed abruptly (a common occurrence in Docker development), the database often fails to close its lock files or flush its transaction logs, leading to corruption. Furthermore, in the specific context of Artifactory 7.x running in Docker, the embedded database has known stability issues that can cause boot loops or data loss during upgrades.
+
+We will reject this default. Instead of allowing every new building in our city to drill its own private well, we will build a centralized water treatment plant. We will deploy **PostgreSQL 17** as a first-class piece of "City Infrastructure."
+
+This decision pays dividends beyond just Artifactory. By establishing a robust, SSL-secured, shared database service now, we are laying the foundation for the rest of our stack. When we deploy **SonarQube** (for code quality), **Mattermost** (for ChatOps), and **Grafana** (for monitoring) in future articles, they will not need their own private databases. They will simply plug into this existing, high-performance infrastructure. This reduces our resource footprint and centralizes our backup and security strategy to a single, manageable point.
+
+## 2.2 The Security Shift: Navigating PostgreSQL 15+
+
+Choosing to deploy a modern database comes with modern responsibilities. We are deploying **PostgreSQL 17**, the latest stable version supported by Artifactory and SonarQube. This forces us to confront a significant "breaking change" introduced in version 15 that alters the default security posture of the database.
+
+For decades, PostgreSQL had a permissive default: any user connected to a database had implicit permission to create tables in the default `public` schema. This was convenient for developers but presented a security risk—a compromised low-privilege account could fill the database with garbage data or malicious tables.
+
+In PostgreSQL 15, this default was revoked. The `public` schema is now owned strictly by the database owner, and the `PUBLIC` role (representing all users) no longer has `CREATE` privileges.
+
+This shift breaks the "lazy" setup scripts found in many older tutorials. If we simply create an `artifactory` user and a database, the application will crash on startup with "Permission Denied" errors when it attempts to initialize its schema.
+
+To navigate this, we must adopt a **"Zero Trust"** mindset in our initialization architecture. We cannot rely on implicit permissions. Our setup scripts must now be explicit, executing specific `GRANT CREATE, USAGE ON SCHEMA public` commands for each service user. This ensures that our database environment remains secure by default, with every privilege intentionally defined rather than accidentally inherited.
+
+## 2.3 The "Microservice Explosion" (Artifactory 7 vs. 6)
+
+If you have used older versions of Artifactory (v6 and below), you might remember it as a standard Java web application running inside Apache Tomcat. You deployed a `.war` file, mapped port 8081, and you were done.
+
+Artifactory 7 abandoned this monolithic architecture in favor of a scalable, cloud-native design. It is no longer a single application; it is a **cluster of microservices** running inside a single container.
+
+When we launch our container, we aren't just starting a web app; we are spinning up an entire internal service mesh:
+
+1.  **Artifactory (Service):** The core artifact management engine (Java).
+2.  **Access:** A dedicated security service that handles authentication, tokens, and permissions (Java).
+3.  **Metadata:** A service for indexing and calculating metadata for packages (Java).
+4.  **Frontend:** The web UI service.
+5.  **Router:** The API Gateway and service registry (written in Go, based on Traefik).
+
+This architectural shift creates new complexity for our "City Planning." We can no longer simply talk to the Tomcat backend on port 8081. Instead, all traffic must flow through the **Router** on **port 8082**.
+
+The Router is the traffic cop. It acts as the entry point for the "City," terminating SSL and directing requests to the correct internal microservice. This creates a complex internal environment where these services must communicate with each other securely over `localhost`. If this internal network is misconfigured, the Router will fail to connect to the Access service, and the entire container will enter a boot loop.
+
+## 2.4 The TLS Trap: "Strict Compliance" (Go vs. OpenSSL)
+
+The introduction of the Go-based Router brings a subtle but critical compatibility challenge regarding our Public Key Infrastructure (PKI). In Article 2, we built a standard "Passport Printer" script using OpenSSL. We used this to generate certificates for GitLab (Nginx) and Jenkins (Jetty), and both accepted them without complaint.
+
+However, the Artifactory Router is different. It is built on the Go programming language's standard library (`crypto/x509`), which is notorious in the DevOps community for its strict, unforgiving adherence to RFC 5280 standards. While C-based libraries like OpenSSL are often permissive—ignoring minor spec violations—Go will reject a certificate that is technically imperfect.
+
+This creates a "TLS Trap." If we try to reuse our standard certificate generation script for Artifactory, the Router will fail to start, often with cryptic "handshake failure" or "unhandled critical extension" errors.
+
+The issue lies in the **Key Usage** extensions.
+1.  **Criticality:** The RFC suggests that if a certificate defines specific Key Usages (like Digital Signature), that extension should be marked **CRITICAL**. Go enforces this; many others do not.
+2.  **Dual Role (mTLS):** Because the Router acts as a **Server** (accepting traffic from your browser) *and* a **Client** (sending traffic to internal microservices like Access), it requires a certificate that explicitly permits *both* roles. It needs `ExtendedKeyUsage` values for `serverAuth` and `clientAuth`.
+
+To solve this, we cannot use our existing tools. We must engineer a bespoke "Strict Compliance" certificate generation process specifically for Artifactory, ensuring every flag is set exactly as the Go library expects.
+
+## 2.5 The "Hybrid Persistence" Pattern
+
+Finally, we must address how we store the data. Artifactory creates massive amounts of binary data. Storing this in a standard Docker volume is best practice for performance and safety (preventing accidental deletion). However, Artifactory also relies on complex configuration files (like `system.yaml`) that we need to edit frequently from our host machine.
+
+If we mount a Docker volume to the data directory, the configuration files are buried inside the volume, inaccessible to our host's text editors. If we bind-mount a host directory, we expose the database files to potential permission corruption by the host OS.
+
+To resolve this, we will use a **Hybrid Persistence** pattern using layered mounts.
+
+1.  **The Foundation (Volume):** We will mount a Docker-managed volume (`artifactory-data`) to the root application directory `/var/opt/jfrog/artifactory`. This handles the heavy, opaque data storage safely.
+2.  **The Overlays (Bind Mounts):** We will then bind-mount specific subdirectories from our host (`~/cicd_stack/artifactory/var/etc`) *over* the corresponding directories inside the container.
+
+This strategy gives us the best of both worlds: the robustness of a managed volume for the "blob" storage, and the convenience of host-side editing for our configuration files.
