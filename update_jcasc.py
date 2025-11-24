@@ -33,7 +33,7 @@ def update_jcasc():
         }
     }
 
-    # Navigate to credentials list
+    # Navigate to credentials list safely
     if 'system' not in jcasc['credentials']:
         jcasc['credentials']['system'] = {'domainCredentials': [{'credentials': []}]}
 
@@ -46,7 +46,7 @@ def update_jcasc():
         creds_list = []
         domain_creds[0]['credentials'] = creds_list
 
-    # Check existence
+    # Check existence (Idempotency)
     exists = False
     for cred in creds_list:
         if 'usernamePassword' in cred and cred['usernamePassword'].get('id') == 'artifactory-creds':
@@ -65,7 +65,7 @@ def update_jcasc():
     if 'unclassified' not in jcasc:
         jcasc['unclassified'] = {}
 
-    # UPDATED BLOCK BASED ON YOUR SCHEMA
+    # The v4+ Schema: 'jfrogInstances' instead of 'artifactoryServers'
     jcasc['unclassified']['artifactoryBuilder'] = {
         'useCredentialsPlugin': True,
         'jfrogInstances': [{

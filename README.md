@@ -1384,3 +1384,313 @@ This validates our entire networking stack. It confirms that:
 3.  It is ready to accept uploads.
 
 This is the "Warehouse" equivalent of a loading dock with clear signage. We don't force developers to guess the URL structure; we provide it.
+
+# Chapter 6: Action Plan (Part 3) - The Integrator
+
+We have a fully functional Factory (Jenkins) and a fully functional Warehouse (Artifactory). Currently, however, they are completely unaware of each other. To complete our supply chain, we need to introduce them.
+
+This integration requires two distinct operations:
+1.  **Authentication:** Jenkins needs the "Keys to the Warehouse" (the Admin Token we just generated).
+2.  **Configuration:** Jenkins needs to know the address of the Warehouse (`artifactory.cicd.local`) and be configured to use the Artifactory Plugin.
+
+We will automate this process using a new script, `07-update-jenkins.sh`. However, before we write the code, we must navigate a specific Docker behavior that trips up many DevOps engineers during day-two operations.
+
+## 6.1 The "Stale Env" Trap
+
+Our first task is to get the `ARTIFACTORY_ADMIN_TOKEN` from our host's master secrets file (`cicd.env`) into the Jenkins container.
+
+In Article 4, we established a "Scoped Environment" pattern. We created a specific file, `jenkins.env`, which is passed to the container using the `--env-file` flag. The logical assumption is that if we append a new variable to `jenkins.env` and restart the container, Jenkins will see it.
+
+This assumption is false.
+
+Docker containers are immutable snapshots. When you run `docker run`, the Docker daemon reads the `--env-file`, resolves the variables, and **bakes them into the container's configuration**. The link to the file on the host is severed immediately after creation.
+
+If you run `docker stop jenkins-controller` and then `docker start jenkins-controller`, Docker simply reloads the *original* configuration snapshot. It does **not** re-read the file on the host. The container will come back up, but it will still have the "Stale Environment" from when it was first built, effectively ignoring our new token.
+
+To solve this, we cannot use a simple restart. We must destroy the container (`docker rm`) and recreate it (`docker run`). This forces the daemon to read the modified `jenkins.env` file and generate a new configuration snapshot. Our integration script will handle this by triggering the `03-deploy-controller.sh` script we wrote in the previous article, ensuring a clean environment reload.
+
+## 6.2 The "JCasC Schema" Nightmare
+
+With the credentials ready to be injected, we face our second integration hurdle: configuring the Jenkins plugin itself.
+
+In a standard "Configuration as Code" setup, you would typically find the plugin's YAML schema by looking at the documentation or exporting the current configuration. If you search online for "Jenkins Artifactory JCasC example," 99% of the results—including official JFrog examples from just a year ago—will tell you to use a block named `artifactoryServers`.
+
+If you try to use that block with the modern plugin (version 4.x+), Jenkins will crash on startup.
+
+This is due to a massive, undocumented architectural shift. The newer Jenkins Artifactory Plugin is no longer a standalone integration; it has been re-architected as a wrapper around the JFrog CLI. This change silently broke the JCasC schema. The configuration key `artifactoryServers` was removed and replaced with `jfrogInstances`.
+
+To make matters worse, the internal structure changed as well. Simple fields like `credentialsId` were moved inside nested objects like `deployerCredentialsConfig` and `resolverCredentialsConfig`.
+
+We discovered this only by reverse-engineering the error logs during our build process. The plugin threw an `UnknownAttributesException`, listing `jfrogInstances` as a valid attribute. This validates a core DevOps principle: **Never trust the documentation blindly; trust the error logs.** We must construct our configuration to match this new, strict schema, or the "Foreman" will never be able to talk to the "Warehouse."
+
+## 6.3 Structured Data vs. Text Hacking (The Python Helper)
+
+To inject this complex `jfrogInstances` configuration block into our existing `jenkins.yaml`, we have a choice of tools.
+
+The "quick and dirty" approach would be to use `sed` or `cat` to append text to the end of the file. This is **Text Hacking**. It is fragile, dangerous, and unprofessional. YAML relies on strict indentation. A single misplaced space in a `sed` command can break the entire Jenkins configuration, causing the controller to fail on boot. Furthermore, `sed` has no concept of structure; it cannot check if the configuration already exists, leading to duplicate entries if the script runs twice.
+
+The "First Principles" approach is **Structured Data Manipulation**. We treat the YAML file as a data object, not a text stream.
+
+We will write a Python helper script, `update_jcasc.py`. This script uses the `PyYAML` library to:
+
+1.  **Parse** the existing `jenkins.yaml` into a Python dictionary.
+2.  **Check** if the Artifactory configuration already exists (Idempotency).
+3.  **Inject** the new `jfrogInstances` block with the correct indentation and structure.
+4.  **Dump** the valid YAML back to disk.
+
+Create this file at `~/cicd_stack/jenkins/config/update_jcasc.py`.
+
+```python
+#!/usr/bin/env python3
+
+import sys
+import yaml
+import os
+
+# Path to the JCasC file
+JCAS_FILE = os.path.expanduser("~/cicd_stack/jenkins/config/jenkins.yaml")
+
+def update_jcasc():
+    print(f"[INFO] Reading JCasC file: {JCAS_FILE}")
+
+    try:
+        with open(JCAS_FILE, 'r') as f:
+            jcasc = yaml.safe_load(f)
+    except FileNotFoundError:
+        print(f"[ERROR] File not found: {JCAS_FILE}")
+        sys.exit(1)
+
+    # 1. Add Artifactory Credentials
+    print("[INFO] Injecting Artifactory credentials block...")
+
+    if 'credentials' not in jcasc:
+        jcasc['credentials'] = {'system': {'domainCredentials': [{'credentials': []}]}}
+
+    artifactory_cred = {
+        'usernamePassword': {
+            'id': 'artifactory-creds',
+            'scope': 'GLOBAL',
+            'description': 'Artifactory Admin Token',
+            'username': '${JENKINS_ARTIFACTORY_USERNAME}',
+            'password': '${JENKINS_ARTIFACTORY_PASSWORD}'
+        }
+    }
+
+    # Navigate to credentials list safely
+    if 'system' not in jcasc['credentials']:
+        jcasc['credentials']['system'] = {'domainCredentials': [{'credentials': []}]}
+
+    domain_creds = jcasc['credentials']['system']['domainCredentials']
+    if not domain_creds:
+        domain_creds.append({'credentials': []})
+
+    creds_list = domain_creds[0]['credentials']
+    if creds_list is None:
+        creds_list = []
+        domain_creds[0]['credentials'] = creds_list
+
+    # Check existence (Idempotency)
+    exists = False
+    for cred in creds_list:
+        if 'usernamePassword' in cred and cred['usernamePassword'].get('id') == 'artifactory-creds':
+            exists = True
+            break
+
+    if not exists:
+        creds_list.append(artifactory_cred)
+        print("[INFO] Credential 'artifactory-creds' added.")
+    else:
+        print("[INFO] Credential 'artifactory-creds' already exists. Skipping.")
+
+    # 2. Add Artifactory Server Configuration (Updated Schema)
+    print("[INFO] Injecting Artifactory Server configuration (v4+ Schema)...")
+
+    if 'unclassified' not in jcasc:
+        jcasc['unclassified'] = {}
+
+    # The v4+ Schema: 'jfrogInstances' instead of 'artifactoryServers'
+    jcasc['unclassified']['artifactoryBuilder'] = {
+        'useCredentialsPlugin': True,
+        'jfrogInstances': [{
+            'instanceId': 'artifactory',
+            'url': '${JENKINS_ARTIFACTORY_URL}',
+            'artifactoryUrl': '${JENKINS_ARTIFACTORY_URL}',
+            'deployerCredentialsConfig': {
+                'credentialsId': 'artifactory-creds'
+            },
+            'resolverCredentialsConfig': {
+                'credentialsId': 'artifactory-creds'
+            },
+            'bypassProxy': True,
+            'connectionRetry': 3,
+            'timeout': 300
+        }]
+    }
+
+    # 3. Write back to file
+    print("[INFO] Writing updated JCasC file...")
+    with open(JCAS_FILE, 'w') as f:
+        yaml.dump(jcasc, f, default_flow_style=False, sort_keys=False)
+
+    print("[INFO] JCasC update complete.")
+
+if __name__ == "__main__":
+    update_jcasc()
+```
+
+### Deconstructing the Helper
+
+* **The Schema Logic:** Notice the structure under `artifactoryBuilder`. We define `jfrogInstances` (plural) as a list containing our single server. We use `${JENKINS_ARTIFACTORY_URL}` as a placeholder, which Jenkins will resolve at runtime from the environment variables we are about to inject.
+* **`bypassProxy: True`:** This is a critical networking setting for our architecture. If your host machine uses a corporate proxy, Jenkins might try to route requests for `artifactory.cicd.local` through that external proxy, causing a connection failure. This flag forces Jenkins to treat Artifactory as an internal, direct-access service.
+* **Idempotency:** The script checks `if not exists` before appending the credential. This allows us to run the integration script multiple times without corrupting the file with duplicate entries.
+
+## 6.4 The Integrator Script (`07-update-jenkins.sh`)
+
+We now have all the components required for integration: the Admin Token in `cicd.env`, the Python helper to patch the YAML, and the understanding that we must recreate the container to apply these changes.
+
+This script is the conductor. It orchestrates the entire update process in a specific order to ensure a clean state transition.
+
+Create this file at `~/cicd_stack/artifactory/07-update-jenkins.sh`.
+
+```bash
+#!/usr/bin/env bash
+
+#
+# -----------------------------------------------------------
+#               07-update-jenkins.sh
+#
+#  This script integrates Jenkins with Artifactory.
+#
+#  1. Prereqs: Installs python3-yaml on host.
+#  2. Secrets: Injects Artifactory secrets into jenkins.env.
+#  3. JCasC:   Updates jenkins.yaml with Artifactory config.
+#  4. Apply:   Re-deploys Jenkins (Recreate Container).
+#
+# -----------------------------------------------------------
+
+set -e
+
+# --- Paths ---
+CICD_ROOT="$HOME/cicd_stack"
+# The module where we defined the Jenkins deployment scripts
+JENKINS_MODULE_DIR="$HOME/Documents/FromFirstPrinciples/articles/0008_cicd_part04_jenkins"
+JENKINS_ENV_FILE="$JENKINS_MODULE_DIR/jenkins.env"
+DEPLOY_SCRIPT="$JENKINS_MODULE_DIR/03-deploy-controller.sh"
+
+# Path to the Python helper
+PY_HELPER="update_jcasc.py"
+# Path to master secrets
+MASTER_ENV="$CICD_ROOT/cicd.env"
+
+echo "[INFO] Starting Jenkins <-> Artifactory Integration..."
+
+# --- 1. Prerequisites ---
+echo "[INFO] Checking for Python YAML library..."
+if ! python3 -c "import yaml" 2>/dev/null; then
+    echo "[WARN] python3-yaml not found. Installing..."
+    sudo apt-get update -qq
+    sudo apt-get install -y -qq python3-yaml python3-dotenv
+else
+    echo "[INFO] python3-yaml is already installed."
+fi
+
+# --- 2. Secret Injection ---
+if [ ! -f "$MASTER_ENV" ]; then
+    echo "[ERROR] Master environment file not found: $MASTER_ENV"
+    exit 1
+fi
+
+# Load ARTIFACTORY_ADMIN_TOKEN
+source "$MASTER_ENV"
+
+if [ -z "$ARTIFACTORY_ADMIN_TOKEN" ]; then
+    echo "[ERROR] ARTIFACTORY_ADMIN_TOKEN not found in cicd.env."
+    echo "       Please ensure you have completed Module 05 setup."
+    exit 1
+fi
+
+if [ ! -f "$JENKINS_ENV_FILE" ]; then
+    echo "[ERROR] Jenkins env file not found at: $JENKINS_ENV_FILE"
+    exit 1
+fi
+
+echo "[INFO] Injecting Artifactory secrets into jenkins.env..."
+
+# Append secrets only if they don't exist
+grep -q "JENKINS_ARTIFACTORY_URL" "$JENKINS_ENV_FILE" || cat << EOF >> "$JENKINS_ENV_FILE"
+
+# --- Artifactory Integration ---
+JENKINS_ARTIFACTORY_URL=https://artifactory.cicd.local:8082/artifactory
+JENKINS_ARTIFACTORY_USERNAME=admin
+JENKINS_ARTIFACTORY_PASSWORD=$ARTIFACTORY_ADMIN_TOKEN
+EOF
+
+echo "[INFO] Secrets injected."
+
+# --- 3. Update JCasC ---
+echo "[INFO] Updating JCasC configuration..."
+if [ ! -f "$PY_HELPER" ]; then
+    echo "[ERROR] Python helper script not found at $PY_HELPER"
+    echo "       Please create the update_jcasc.py script first."
+    exit 1
+fi
+
+python3 "$PY_HELPER"
+
+# --- 4. Re-Deploy Jenkins ---
+echo "[INFO] Triggering Jenkins Re-deployment (Container Recreate)..."
+
+if [ ! -x "$DEPLOY_SCRIPT" ]; then
+    echo "[ERROR] Deploy script not found or not executable: $DEPLOY_SCRIPT"
+    exit 1
+fi
+
+# Execute the deploy script from its own directory context
+(cd "$JENKINS_MODULE_DIR" && ./03-deploy-controller.sh)
+
+echo "[SUCCESS] Integration update complete."
+echo "[INFO] Jenkins is restarting. Wait for initialization."
+```
+
+### Deconstructing the Integrator
+
+**1. Prerequisites (The "Python Capability"):**
+We cannot assume the host machine has the necessary libraries to run our helper script. The script checks for `python3-yaml` and installs it via `apt` if missing. This ensures our automation doesn't crash due to missing dependencies.
+
+**2. Secret Injection (Bridging the Gap):**
+This block acts as the bridge between the two articles. It reads the `ARTIFACTORY_ADMIN_TOKEN` from the central `cicd.env` (created in this article) and appends it to the `jenkins.env` (created in the previous article).
+Notice the variable mapping:
+
+* `JENKINS_ARTIFACTORY_PASSWORD` is populated with the value of `ARTIFACTORY_ADMIN_TOKEN`.
+  This cleanly injects the secret into the Jenkins container's scope without exposing it in the Docker command history.
+
+**3. The "Re-Deploy" (Solving the Stale Env):**
+This is the critical fix for the "Stale Env" trap. Instead of running `docker restart`, the script changes directory (`cd`) to the Jenkins module and executes `./03-deploy-controller.sh`. This effectively stops, removes, and recreates the container using the *newly modified* `jenkins.env` file, ensuring the new token is actually loaded into the environment.
+
+## 6.5 Verification
+
+Run the script:
+
+```bash
+chmod +x 07-update-jenkins.sh
+./07-update-jenkins.sh
+```
+
+Watch the logs. The Jenkins controller will restart. Once it is back online (approx. 2 minutes), perform the final verification:
+
+1.  Log in to Jenkins at `https://jenkins.cicd.local:10400`.
+2.  Navigate to **Manage Jenkins** -\> **System**.
+3.  Scroll down to the **JFrog** (or Artifactory) section.
+4.  You will see the "artifactory" server configuration pre-filled.
+5.  Click **Test Connection**.
+
+You should see the message: **"Found JFrog Artifactory 7.90.15 at [https://artifactory.cicd.local:8082/artifactory](https://www.google.com/search?q=https://artifactory.cicd.local:8082/artifactory)"**.
+
+This single green message confirms everything:
+
+* **DNS Resolution:** Jenkins found `artifactory.cicd.local`.
+* **SSL Trust:** The JVM trusted the certificate.
+* **Authentication:** The injected Admin Token worked.
+* **Plugin Logic:** The `jfrogInstances` JCasC schema was parsed correctly.
+
+The "Factory" and the "Warehouse" are now connected.
