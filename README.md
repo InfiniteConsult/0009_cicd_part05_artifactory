@@ -130,3 +130,633 @@ To resolve this, we will use a **Hybrid Persistence** pattern using layered moun
 2.  **The Overlays (Bind Mounts):** We will then bind-mount specific subdirectories from our host (`~/cicd_stack/artifactory/var/etc`) *over* the corresponding directories inside the container.
 
 This strategy gives us the best of both worlds: the robustness of a managed volume for the "blob" storage, and the convenience of host-side editing for our configuration files.
+
+
+
+
+# Chapter 3: Action Plan (Part 1) - The Shared Data Layer
+
+## 3.1 The Architect (`01-setup-database.sh`)
+
+We begin by establishing our shared data infrastructure. This script acts as the "Architect" for our database service. It runs entirely on the host machine and is responsible for preparing the filesystem, generating cryptographic secrets, and defining the security policies that the database container will enforce upon startup.
+
+This script creates a directory structure at `~/cicd_stack/postgres`, populating it with SSL certificates, configuration files, and initialization scripts. It solves the "Bootstrap Paradox" by ensuring that all passwords and permissions exist *before* the database process is ever spawned.
+
+Create this file at `~/cicd_stack/postgres/01-setup-database.sh`.
+
+```bash
+#!/usr/bin/env bash
+
+#
+# -----------------------------------------------------------
+#               01-setup-database.sh
+#
+#  This is the "Architect" script for the Shared Database.
+#  It prepares the host environment for PostgreSQL 17.
+#
+#  1. Secrets: Generates/Persists passwords for all 4 services.
+#  2. Certs: Issues SSL certs and fixes permissions (UID 999).
+#  3. Security: Generates pg_hba.conf enforcing SSL for cicd-net.
+#  4. Init: Creates the SQL script to initialize databases with
+#           PostgreSQL 17 compatible permissions.
+#
+# -----------------------------------------------------------
+
+set -e
+
+# --- 1. Define Paths ---
+HOST_CICD_ROOT="$HOME/cicd_stack"
+POSTGRES_BASE="$HOST_CICD_ROOT/postgres"
+MASTER_ENV_FILE="$HOST_CICD_ROOT/cicd.env"
+
+# Directories to be mounted
+DIR_CERTS="$POSTGRES_BASE/certs"
+DIR_CONFIG="$POSTGRES_BASE/config"
+DIR_INIT="$POSTGRES_BASE/init"
+
+# Certificate Authority Paths
+CA_DIR="$HOST_CICD_ROOT/ca"
+SERVICE_NAME="postgres.cicd.local"
+CA_SERVICE_DIR="$CA_DIR/pki/services/$SERVICE_NAME"
+SRC_CRT="$CA_SERVICE_DIR/$SERVICE_NAME.crt.pem"
+SRC_KEY="$CA_SERVICE_DIR/$SERVICE_NAME.key.pem"
+SRC_ROOT_CA="$CA_DIR/pki/certs/ca.pem"
+
+echo "Starting PostgreSQL 'Architect' Setup..."
+
+# --- 2. Secrets Management ---
+echo "--- Phase 1: Secrets Management ---"
+
+if [ ! -f "$MASTER_ENV_FILE" ]; then
+    echo "ERROR: Master env file not found at $MASTER_ENV_FILE"
+    exit 1
+fi
+
+source "$MASTER_ENV_FILE"
+
+# Helper function to check and generate secret
+check_and_generate_secret() {
+    local var_name=$1
+    local var_value=${!var_name}
+    local description=$2
+
+    if [ -z "$var_value" ]; then
+        echo "Generating new $description ($var_name)..."
+        # 32 bytes of entropy = 64 hex characters
+        local new_secret=$(openssl rand -hex 32)
+
+        echo "" >> "$MASTER_ENV_FILE"
+        echo "# $description" >> "$MASTER_ENV_FILE"
+        echo "$var_name=\"$new_secret\"" >> "$MASTER_ENV_FILE"
+
+        # Export for current session
+        export $var_name="$new_secret"
+    else
+        echo "Found existing $var_name."
+    fi
+}
+
+check_and_generate_secret "POSTGRES_ROOT_PASSWORD" "PostgreSQL Root Password"
+check_and_generate_secret "ARTIFACTORY_DB_PASSWORD" "Artifactory DB Password"
+check_and_generate_secret "SONARQUBE_DB_PASSWORD" "SonarQube DB Password"
+check_and_generate_secret "MATTERMOST_DB_PASSWORD" "Mattermost DB Password"
+check_and_generate_secret "GRAFANA_DB_PASSWORD" "Grafana DB Password"
+
+# --- 3. Certificate Preparation ---
+echo "--- Phase 2: TLS Certificate Preparation ---"
+
+# Ensure local directories exist
+mkdir -p "$DIR_CERTS"
+mkdir -p "$DIR_CONFIG"
+mkdir -p "$DIR_INIT"
+
+# Check if cert already exists in the CA structure
+if [ ! -f "$SRC_CRT" ]; then
+    echo "Certificate for $SERVICE_NAME not found in CA. Issuing new certificate..."
+
+    # Use a subshell to change directory without affecting the script
+    (
+        cd ../0006_cicd_part02_certificate_authority || exit 1
+        # Check if the script exists
+        if [ ! -x "./02-issue-service-cert.sh" ]; then
+            echo "ERROR: Cert issuance script not found or not executable."
+            exit 1
+        fi
+        ./02-issue-service-cert.sh "$SERVICE_NAME"
+    )
+else
+    echo "Certificate for $SERVICE_NAME already exists. Skipping issuance."
+fi
+
+# Copy certificates to the Postgres mount directory
+echo "Copying certificates to $DIR_CERTS..."
+# We rename them to standard postgres names for simplicity in the run command
+sudo cp "$SRC_CRT" "$DIR_CERTS/server.crt"
+sudo cp "$SRC_KEY" "$DIR_CERTS/server.key"
+sudo cp "$SRC_ROOT_CA" "$DIR_CERTS/root.crt"
+
+# CRITICAL: Permission Fix for Container UID 999
+# PostgreSQL refuses to start if the key file is readable by anyone else.
+# The container user 'postgres' usually has UID 999.
+echo "Applying strict permissions to SSL keys (requires sudo)..."
+echo "Setting ownership to UID 999 and mode 0600."
+
+sudo chown -R 999:999 "$DIR_CERTS"
+sudo chmod 600 "$DIR_CERTS/server.key"
+# Public certs can be readable
+sudo chmod 644 "$DIR_CERTS/server.crt"
+sudo chmod 644 "$DIR_CERTS/root.crt"
+
+
+# --- 4. Security Policy (pg_hba.conf) ---
+echo "--- Phase 3: Generating pg_hba.conf ---"
+HBA_FILE="$DIR_CONFIG/pg_hba.conf"
+
+# We explicitly restrict access to the docker subnet (172.30.0.0/24)
+# and enforce SSL (hostssl).
+cat << EOF > "$HBA_FILE"
+# TYPE  DATABASE        USER            ADDRESS                 METHOD
+
+# 1. Localhost (Loopback) - Allow for local debugging/healthchecks
+local   all             all                                     trust
+hostssl all             all             127.0.0.1/32            scram-sha-256
+
+# 2. CICD Network - Reject unencrypted connections
+hostnossl all           all             172.30.0.0/24           reject
+
+# 3. CICD Network - Allow SSL connections with password
+hostssl all             all             172.30.0.0/24           scram-sha-256
+
+# 4. Reject everything else (Implicit, but good for documentation)
+# host    all             all             0.0.0.0/0               reject
+EOF
+echo "Policy written to $HBA_FILE"
+
+
+# --- 5. Init Script Generation ---
+echo "--- Phase 4: Generating Initialization SQL ---"
+INIT_SCRIPT="$DIR_INIT/01-init.sh"
+
+# We use a shell script that calls psql. This allows us to use variables.
+# Note: We use 'cat << "EOF"' (quoted EOF) to prevent variable expansion
+# by the host shell during generation. The variables ($POSTGRES_USER, etc.)
+# will be expanded by the CONTAINER shell at runtime.
+
+cat << "EOF" > "$INIT_SCRIPT"
+#!/bin/bash
+set -e
+
+echo "--- Initializing Multi-Tenant Databases ---"
+
+# Define constants for PG17 Compatibility
+# We use 'C' collation to satisfy SonarQube's strict case-sensitivity requirement
+# while maintaining compatibility with Artifactory, Mattermost, and Grafana.
+DB_ENCODING='UTF8'
+DB_COLLATE='C'
+DB_CTYPE='C'
+
+# Execute SQL block
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
+
+    -- ===================================================
+    -- 1. ARTIFACTORY
+    -- ===================================================
+    CREATE USER artifactory WITH PASSWORD '$ARTIFACTORY_DB_PASSWORD';
+    CREATE DATABASE artifactory WITH OWNER artifactory ENCODING='$DB_ENCODING' LC_COLLATE='$DB_COLLATE' LC_CTYPE='$DB_CTYPE' TEMPLATE=template0;
+    GRANT ALL PRIVILEGES ON DATABASE artifactory TO artifactory;
+    -- PG17 Fix: Explicitly grant creation on public schema
+    GRANT CREATE, USAGE ON SCHEMA public TO artifactory;
+
+    -- ===================================================
+    -- 2. SONARQUBE
+    -- ===================================================
+    CREATE USER sonarqube WITH PASSWORD '$SONARQUBE_DB_PASSWORD';
+    CREATE DATABASE sonarqube WITH OWNER sonarqube ENCODING='$DB_ENCODING' LC_COLLATE='$DB_COLLATE' LC_CTYPE='$DB_CTYPE' TEMPLATE=template0;
+    GRANT ALL PRIVILEGES ON DATABASE sonarqube TO sonarqube;
+    -- PG17 Fix: Explicitly grant creation on public schema
+    GRANT CREATE, USAGE ON SCHEMA public TO sonarqube;
+
+    -- ===================================================
+    -- 3. MATTERMOST
+    -- ===================================================
+    CREATE USER mattermost WITH PASSWORD '$MATTERMOST_DB_PASSWORD';
+    CREATE DATABASE mattermost WITH OWNER mattermost ENCODING='$DB_ENCODING' LC_COLLATE='$DB_COLLATE' LC_CTYPE='$DB_CTYPE' TEMPLATE=template0;
+    GRANT ALL PRIVILEGES ON DATABASE mattermost TO mattermost;
+    -- PG17 Fix: Explicitly grant creation on public schema
+    GRANT CREATE, USAGE ON SCHEMA public TO mattermost;
+
+    -- ===================================================
+    -- 4. GRAFANA
+    -- ===================================================
+    CREATE USER grafana WITH PASSWORD '$GRAFANA_DB_PASSWORD';
+    CREATE DATABASE grafana WITH OWNER grafana ENCODING='$DB_ENCODING' LC_COLLATE='$DB_COLLATE' LC_CTYPE='$DB_CTYPE' TEMPLATE=template0;
+    GRANT ALL PRIVILEGES ON DATABASE grafana TO grafana;
+    -- PG17 Fix: Explicitly grant creation on public schema
+    GRANT CREATE, USAGE ON SCHEMA public TO grafana;
+
+EOSQL
+
+echo "--- Database Initialization Complete ---"
+EOF
+
+# Make the init script executable
+chmod +x "$INIT_SCRIPT"
+echo "Init script written to $INIT_SCRIPT"
+
+
+# --- 6. Create Scoped Environment File ---
+echo "--- Phase 5: Creating Scoped postgres.env ---"
+SCOPED_ENV_FILE="$POSTGRES_BASE/postgres.env"
+
+# We map the variables from our Master Env (Host) to the specific
+# variable names expected by the Postgres Image and our Init Script.
+cat << EOF > "$SCOPED_ENV_FILE"
+# Scoped Environment for PostgreSQL Container
+# Auto-generated by 01-setup-database.sh
+
+# 1. Standard PostgreSQL Image Variables
+# Note: We map our POSTGRES_ROOT_PASSWORD to POSTGRES_PASSWORD
+POSTGRES_PASSWORD=$POSTGRES_ROOT_PASSWORD
+POSTGRES_USER=postgres
+POSTGRES_DB=postgres
+
+# 2. Application Passwords
+# These are required by /docker-entrypoint-initdb.d/01-init.sh
+ARTIFACTORY_DB_PASSWORD=$ARTIFACTORY_DB_PASSWORD
+SONARQUBE_DB_PASSWORD=$SONARQUBE_DB_PASSWORD
+MATTERMOST_DB_PASSWORD=$MATTERMOST_DB_PASSWORD
+GRAFANA_DB_PASSWORD=$GRAFANA_DB_PASSWORD
+EOF
+
+# Secure the file (contains cleartext passwords)
+chmod 600 "$SCOPED_ENV_FILE"
+echo "Scoped env file written to $SCOPED_ENV_FILE"
+
+
+echo "--- Setup Complete ---"
+echo "Secrets persisted in cicd.env"
+echo "Scoped secrets created in $SCOPED_ENV_FILE"
+echo "Certificates prepared in $DIR_CERTS (UID 999)"
+echo "Config generated in $DIR_CONFIG"
+echo "Ready to run 02-deploy-database.sh"
+```
+
+### Deconstructing the Architect
+
+This script performs five critical functions that transform a generic PostgreSQL image into a production-grade service.
+
+**1. The "Pre-Computation" Strategy (Phase 1)**
+The `check_and_generate_secret` function generates high-entropy passwords using `openssl rand` and saves them to our master `cicd.env` file *before* the container ever starts. This prevents the "First Run" race condition where an application might try to connect before a password is fully established. Note that we generate passwords for Artifactory, SonarQube, Mattermost, and Grafana all at once. We are provisioning the city's infrastructure in one go.
+
+**2. The "Leaky Container" Fix (UID 999) (Phase 2)**
+This is one of the most common "gotchas" in Docker database deployments. The official PostgreSQL container runs as user `postgres` with a fixed **UID 999**. When we bind-mount our host's certificate directory (`certs/`) into the container, the permissions bleed through. If the private key is owned by our host user (e.g., UID 1000), the database process inside the container (UID 999) cannot read it and will crash immediately.
+We solve this with "Host-Side Surgery": `sudo chown -R 999:999`. We explicitly set the ownership on the host so it matches the guest's expectation.
+
+**3. The "Bouncer" (Phase 3)**
+We generate a strict `pg_hba.conf` file. This acts as the firewall for the database application layer.
+
+* **`hostnossl ... reject`**: This is the "No Shirt, No Service" policy. We explicitly reject any connection attempt from the network that does not use SSL.
+* **`scram-sha-256`**: We enforce the modern SCRAM authentication method, replacing the vulnerable `md5` default. This adds cryptographic salt and channel binding, preventing "Pass-the-Hash" attacks.
+
+**4. The "Concrete Foundation" and "Zero Trust" (Phase 4)**
+The `init.sh` script is where we handle the deep architectural requirements.
+
+* **`DB_COLLATE='C'`**: We hardcode the collation to `C`. This forces the database to use raw byte-value sorting rather than complex, culturally-aware sorting logic. This is a hard requirement for **SonarQube** (our next article), which requires strict case sensitivity. Changing collation later is impossible without wiping the database, so we must pour this concrete correctly now.
+* **`GRANT CREATE, USAGE ON SCHEMA public`**: This handles the PostgreSQL 15 security shift. By default, new users can no longer create tables in the public schema. We explicitly `GRANT` these permissions to our service users, adhering to a "Zero Trust" model where access is explicitly defined, not implicitly assumed.
+
+
+
+## 3.2 The Launcher (`02-deploy-database.sh`)
+
+With our configuration assets generated and permissions fixed, we can now launch the database container. This script acts as the "Construction Crew," taking the blueprints provided by the Architect and assembling the running service.
+
+It performs a "Clean Slate" protocol—stopping and removing any existing instance—to ensure that configuration changes (like our new `pg_hba.conf`) are always applied fresh.
+
+Create this file at `~/cicd_stack/postgres/02-deploy-database.sh`.
+
+```bash
+#!/usr/bin/env bash
+
+#
+# -----------------------------------------------------------
+#               02-deploy-database.sh
+#
+#  This is the "Launcher" script for the Shared Database.
+#  It runs the PostgreSQL 17 container using the assets
+#  prepared by 01-setup-database.sh.
+#
+# -----------------------------------------------------------
+
+set -e
+
+# --- 1. Define Paths ---
+HOST_CICD_ROOT="$HOME/cicd_stack"
+POSTGRES_BASE="$HOST_CICD_ROOT/postgres"
+
+# Prerequisite files
+SCOPED_ENV_FILE="$POSTGRES_BASE/postgres.env"
+SSL_KEY="$POSTGRES_BASE/certs/server.key"
+HBA_CONF="$POSTGRES_BASE/config/pg_hba.conf"
+
+echo "Starting PostgreSQL Deployment..."
+
+# --- 2. Prerequisite Checks ---
+# We fail fast if the architect script has not been run.
+if [ ! -f "$SCOPED_ENV_FILE" ]; then
+    echo "ERROR: Scoped env file not found at $SCOPED_ENV_FILE"
+    echo "Please run 01-setup-database.sh first."
+    exit 1
+fi
+
+if [ ! -f "$SSL_KEY" ]; then
+    echo "ERROR: SSL Key not found at $SSL_KEY"
+    echo "Please run 01-setup-database.sh first."
+    exit 1
+fi
+
+if [ ! -f "$HBA_CONF" ]; then
+    echo "ERROR: pg_hba.conf not found at $HBA_CONF"
+    echo "Please run 01-setup-database.sh first."
+    exit 1
+fi
+
+# --- 3. Clean Slate Protocol ---
+# Stop and remove any existing container to ensure a clean start
+if [ "$(docker ps -q -f name=postgres)" ]; then
+    echo "Stopping existing 'postgres' container..."
+    docker stop postgres
+fi
+if [ "$(docker ps -aq -f name=postgres)" ]; then
+    echo "Removing existing 'postgres' container..."
+    docker rm postgres
+fi
+
+# --- 4. Volume Management ---
+# Create the persistent data volume if it doesn't exist
+docker volume create postgres-data > /dev/null
+echo "Verified 'postgres-data' volume."
+
+# --- 5. Deploy Container ---
+echo "Launching PostgreSQL 17 container..."
+
+# Notes on Mounts:
+# 1. postgres-data: Persists the DB files.
+# 2. certs: Provides the SSL keys (Must be owned by UID 999 - fixed in 01).
+# 3. config: Provides the strict pg_hba.conf.
+# 4. init: Provides the SQL script to create Artifactory/Sonar/etc users.
+
+docker run -d \
+  --name postgres \
+  --restart always \
+  --network cicd-net \
+  --hostname postgres.cicd.local \
+  --publish 127.0.0.1:5432:5432 \
+  --env-file "$SCOPED_ENV_FILE" \
+  --volume postgres-data:/var/lib/postgresql/data \
+  --volume "$POSTGRES_BASE/certs":/etc/postgresql/ssl \
+  --volume "$POSTGRES_BASE/config/pg_hba.conf":/etc/postgresql/pg_hba.conf \
+  --volume "$POSTGRES_BASE/init":/docker-entrypoint-initdb.d \
+  postgres:17 \
+  -c ssl=on \
+  -c ssl_cert_file=/etc/postgresql/ssl/server.crt \
+  -c ssl_key_file=/etc/postgresql/ssl/server.key \
+  -c hba_file=/etc/postgresql/pg_hba.conf
+
+echo "PostgreSQL container started."
+echo "Monitor initialization logs with: docker logs -f postgres"
+echo "Wait for 'database system is ready to accept connections' before proceeding."
+```
+
+### Deconstructing the Launcher
+
+This script connects the dots between our physical assets and the running container.
+
+**1. The Identity Assertion (`--hostname`)**
+We explicitly set `--hostname postgres.cicd.local`. This is not cosmetic. This hostname matches the Common Name (CN) of the SSL certificate we generated in the Architect script. This match is what allows clients to use `sslmode=verify-full`. If the container's hostname did not match the certificate, clients would reject the connection as a potential Man-in-the-Middle attack.
+
+**2. The Mount Strategy**
+We map four distinct volumes, each serving a specific architectural purpose:
+
+* `postgres-data`: The **Docker Volume** for the actual database files (opaque, high-performance IO).
+* `certs`: The **Bind Mount** containing our keys (permission-fixed to UID 999).
+* `config`: The **Bind Mount** injecting our strict `pg_hba.conf` "Bouncer."
+* `init`: The **Bind Mount** injecting our SQL script. PostgreSQL automatically executes any `.sh` or `.sql` file found in `/docker-entrypoint-initdb.d` during the very first startup.
+
+**3. The Runtime Flags (`-c`)**
+We override the default PostgreSQL configuration directly in the command line.
+
+* `-c ssl=on`: Forces the server to enable the SSL subsystem.
+* `-c hba_file=...`: Tells PostgreSQL to ignore its default access rules and use our strict `pg_hba.conf` instead.
+
+## 3.3 The Audit (`03-verify-database.sh`)
+
+Deploying the database is not enough. We must verify that our security controls are actually working *before* we try to connect complex applications like Artifactory. If we skip this step, we might spend hours debugging Artifactory connection errors, not knowing if the issue is the network, the password, or the SSL handshake.
+
+We will perform a formal audit using a "Negative Testing" methodology. We want to prove that the database **rejects** insecure connections.
+
+Create this file in your **article source directory** (on your host) at `~/Documents/FromFirstPrinciples/articles/0009_cicd_part05_artifactory/03-verify-database.sh`. This ensures it is mounted into our `dev-container`, where we will run the test.
+
+```bash
+#!/usr/bin/env bash
+
+#
+# -----------------------------------------------------------
+#               03-verify-database.sh
+#
+#  This script audits the PostgreSQL 17 deployment.
+#
+#  USAGE INSTRUCTIONS:
+#  1. This script must be run INSIDE the 'dev-container'.
+#  2. You must stage the secrets file on the HOST first:
+#     cp ~/cicd_stack/postgres/postgres.env ~/Documents/FromFirstPrinciples/data/
+#
+#  What this script checks:
+#  1. Network connectivity to postgres.cicd.local.
+#  2. Strict SSL enforcement (PGSSLMODE=verify-full).
+#  3. Negative Test: Ensures non-SSL connections are REJECTED.
+#  4. Authentication for all 4 service users.
+#  5. Authorization (Can they create tables in 'public'?).
+#
+# -----------------------------------------------------------
+
+set -e
+
+# Fix for Perl locale warnings in some containers
+export LC_ALL=C
+
+echo "Starting Database Verification Audit..."
+
+# --- 1. Dependency Check ---
+# The dev-container might not have the psql client installed.
+if ! command -v psql &> /dev/null; then
+    echo "psql not found. Installing PostgreSQL 17 client..."
+    # We assume sudo is available or we are root in dev-container
+    sudo apt-get update -qq
+    sudo apt-get install -y -qq postgresql-common
+    # Install the official PG repo to get version 17
+    yes | sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh
+    sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client-17
+fi
+
+# --- 2. Load Environment Secrets ---
+# We expect the file to be in ~/data (mapped from Host ~/Documents/FromFirstPrinciples/data)
+ENV_FILE="$HOME/data/postgres.env"
+
+if [ ! -f "$ENV_FILE" ]; then
+    echo "CRITICAL ERROR: Secrets file not found at $ENV_FILE"
+    echo "Please run this command on your HOST machine first:"
+    echo "  cp ~/cicd_stack/postgres/postgres.env ~/Documents/FromFirstPrinciples/data/"
+    exit 1
+fi
+
+echo "Loading secrets from $ENV_FILE..."
+source "$ENV_FILE"
+
+# --- 3. Negative Test: SSL Rejection ---
+verify_ssl_rejection() {
+    echo "---------------------------------------------------"
+    echo "Security Audit: Verifying Non-SSL Rejection"
+
+    # Use Artifactory creds for the test (User doesn't matter, connection type does)
+    export PGPASSWORD="$ARTIFACTORY_DB_PASSWORD"
+
+    # CRITICAL FIX: Use ENV variable, not --set
+    # We attempt to force a non-SSL connection.
+    export PGSSLMODE="disable"
+
+    # We explicitly want this command to FAIL.
+    if psql \
+        --host "postgres.cicd.local" \
+        --username "artifactory" \
+        --dbname "artifactory" \
+        --no-password \
+        --command "SELECT 1;" &> /dev/null; then
+
+        echo " [FAIL] SECURITY BREACH! The database accepted a non-SSL connection."
+        echo "        Check your pg_hba.conf file for 'hostnossl ... reject'."
+        exit 1
+    else
+        echo " [PASS] Connection rejected (Expected). The database correctly blocked non-SSL traffic."
+    fi
+
+    # Unset the variable so it doesn't pollute later tests
+    unset PGSSLMODE
+}
+
+# --- 4. Positive Test: Functional Verification ---
+verify_service_db() {
+    local user=$1
+    local pass=$2
+    local db=$3
+
+    echo "---------------------------------------------------"
+    echo "Auditing Service: $user"
+
+    if [ -z "$pass" ]; then
+        echo " [FAIL] Password variable is empty."
+        return 1
+    fi
+
+    export PGPASSWORD="$pass"
+    # CRITICAL FIXES:
+    # 1. Force strict verification
+    export PGSSLMODE="verify-full"
+    # 2. Tell libpq to look at the System Certificate Bundle (where your CA is)
+    #    Instead of looking in ~/.postgresql/root.crt
+    export PGSSLROOTCERT="/etc/ssl/certs/ca-certificates.crt"
+
+    psql \
+        --host "postgres.cicd.local" \
+        --username "$user" \
+        --dbname "$db" \
+        --no-password \
+        --set ON_ERROR_STOP=1 \
+        <<-EOSQL
+
+        -- 1. Check SSL Status (Using pg_stat_ssl view)
+        SELECT CASE
+            WHEN ssl THEN 'SSL: ACTIVE'
+            ELSE 'SSL: INACTIVE'
+        END AS security_status
+        FROM pg_stat_ssl
+        WHERE pid = pg_backend_pid();
+
+        -- 2. Check PG17 Permissions (Create Table in Public)
+        CREATE TABLE public.verification_test (id int);
+
+        -- 3. Cleanup
+        DROP TABLE public.verification_test;
+
+EOSQL
+
+    if [ $? -eq 0 ]; then
+        echo " [PASS] Authentication successful."
+        echo " [PASS] SSL encryption verified."
+        echo " [PASS] PG17 Schema permissions verified (CRUD OK)."
+    else
+        echo " [FAIL] Verification failed for user: $user"
+        exit 1
+    fi
+}
+
+# --- 5. Execution Loop ---
+
+# 1. First, verify the security controls
+verify_ssl_rejection
+
+# 2. Then verify functionality for all tenants
+verify_service_db "artifactory" "$ARTIFACTORY_DB_PASSWORD" "artifactory"
+verify_service_db "sonarqube" "$SONARQUBE_DB_PASSWORD" "sonarqube"
+verify_service_db "mattermost" "$MATTERMOST_DB_PASSWORD" "mattermost"
+verify_service_db "grafana" "$GRAFANA_DB_PASSWORD" "grafana"
+
+echo "---------------------------------------------------"
+echo "AUDIT COMPLETE: All database services are healthy and secure."
+```
+
+### Deconstructing the Audit
+
+**1. The "Negative Testing" Philosophy**
+Most tutorials only show you how to connect successfully. We prioritize verifying that we *cannot* connect insecurely.
+
+* **`PGSSLMODE="disable"`**: We deliberately attempt to break our own rules by forcing a clear-text connection.
+* **The Payoff:** The script considers it a **`[PASS]`** only if the connection fails. This proves that our `pg_hba.conf` "Bouncer" is physically rejecting unencrypted traffic.
+
+**2. The "Identity" Check (`verify-full`)**
+In the positive tests, we set `PGSSLMODE="verify-full"`.
+
+* **`verify-ca`** only checks the signature (Is this a valid passport?).
+* **`verify-full`** checks the hostname (Is this *your* passport?).
+  By enforcing this, we validate that the certificate we generated (`postgres.cicd.local`) correctly matches the hostname resolved by our internal DNS. This prevents Man-in-the-Middle attacks within our own network.
+
+### Executing the Audit
+
+This script requires a small "data bridging" step because the `dev-container` cannot see the `cicd_stack` deployment directory on the host (for security reasons).
+
+1.  **On your Host:** Stage the secrets file where the dev container can see it.
+    ```bash
+    cp ~/cicd_stack/postgres/postgres.env ~/Documents/FromFirstPrinciples/data/
+    ```
+2.  **Enter the Dev Container:**
+    ```bash
+    ./dev-container.sh
+    ```
+    OR, if already started
+    ```bash
+    ssh -i ~/.ssh/id_rsa -p 10200 <your_username>@127.0.0.1
+    ```
+    OR
+    ```bash
+    docker exec -it dev-container bash
+    ```
+
+3.  **Run the Audit:**
+    ```bash
+    # Inside dev-container
+    cd articles/0009_cicd_part05_artifactory
+    chmod +x 03-verify-database.sh
+    ./03-verify-database.sh
+    ```
+
+**The Result:**
+You will see `[PASS] Connection rejected` when the script attempts an insecure connection. You will then see `[PASS] SSL encryption verified` for every service user, confirming that your `init.sh` script successfully provisioned the multi-tenant architecture with the correct PostgreSQL 17 permissions.
